@@ -58,6 +58,7 @@ startSys:
     mov eax, 4E00h
     int 41h
     jnc .fileFound
+    and al, 2   ;Clear the upper bit (turning errNoFil into errFnf)
     cmp al, errFnf
     je .rootDirOk
 .badRoot:
@@ -102,13 +103,6 @@ startSys:
     call openFiles
     jc badHandle
 
-    lea rsi, cmdNamePair
-    lea rdi, cmdPair
-    mov ecx, cmdNameL
-    xor ebx, ebx    ;Attribute, no attribute
-    call openFiles
-    jc badHandle
-
     lea rsi, biosPair
     call copyFile
     jc badXfer
@@ -117,17 +111,25 @@ startSys:
     call copyFile
     jc badXfer
 
-    lea rsi, cmdPair
-    call copyFile
-    jc badXfer
-
-;We close these handles here to update the DIR entries
+;We close system handles here to update the DIR entries
     mov eax, 3E00h
     mov bx, word [biosHdlDst]
     int 41h
     mov eax, 3E00h
     mov bx, word [dosHdlDst]
     int 41h
+
+;Now also copy the default DOS command interpreter
+    lea rsi, cmdNamePair
+    lea rdi, cmdPair
+    mov ecx, cmdNameL
+    xor ebx, ebx    ;Attribute, no attribute
+    call openFiles
+    jc badHandle
+
+    lea rsi, cmdPair
+    call copyFile
+    jc badXfer
 
 ;Now we must do the fun part, setting the Boot Sector details
 ;Start by searching sysDrive for new files. 
