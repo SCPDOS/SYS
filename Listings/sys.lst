@@ -273,7 +273,7 @@
    160                              <1> noInherit       equ 80h
    161                              <1> ;Bits 8-12 reserved 0
    162                              <1> 
-   163                              <1> diskFullFail    equ 2000h   ;DO NOT USE. IF set, Trigger Int 44h on disk full.
+   163                              <1> diskFullFail    equ 2000h   ;DO NOT USE. IF set, Trigger Int 24h on disk full.
    164                              <1> ;Buffering on writes
    165                              <1> noBufferWrites  equ 4000h   ;If set, dont buffer writes, always update disk
    166                              <1> ;FCB opened file, shouldn't see this as we are depreciating FCB's completely now
@@ -291,7 +291,7 @@
    178                              <1> charDevConOut   equ 2h  ;If set, device is CON output
    179                              <1> charDevNulDev   equ 4h  ;If set, device is NULL device
    180                              <1> charDevClockDev equ 8h  ;If set, device is CLOCK device
-   181                              <1> charDevFastOut  equ 10h ;If set, device supports INT 49h
+   181                              <1> charDevFastOut  equ 10h ;If set, device supports Int 29h
    182                              <1> charDevBinary   equ 20h ;If set, r/w char device in Binary mode!!!
    183                              <1> charDevNoEOF    equ 40h ;If set, no EOF when reading from device!!
    184                              <1> blokFileNoFlush equ 40h ;Set if file has not yet been accessed (sol no flush!)
@@ -363,7 +363,7 @@
    250                              <1> ;Owner = Non-para aligned address => Error? Should maybe lock up system?
    251                              <1> ;blockSize counts the number of paragraphs FROM .program TO THE NEXT MCB!
    252                              <1> ;------------------------------------------------------------------------;
-   253                              <1> ; For Int 41h, the callers registers are saved on their stack in the 
+   253                              <1> ; For Int 21h, the callers registers are saved on their stack in the 
    254                              <1> ; following order, thus allowing for return values to be placed in the 
    255                              <1> ; registers by accessing the caller register stack frame.
    256                              <1> ;------------------------------------------------------------------------;
@@ -438,14 +438,14 @@
    325 00000000 ????                <1>     .return     resb 2  ;Should always be CDh 40h, same place as DOS
    326 00000002 ????????            <1>     .allocSize  resd 1  ;Number of paras in init alloc or when exiting as TSR.
    327 00000006 ????????            <1>                 resd 1  ;Reserved 4 bytes
-   328 0000000A ????????????????    <1>     .oldInt42h  resq 1  ;Int 42h pointer on overlay load
-   329 00000012 ????????????????    <1>     .oldInt43h  resq 1  ;Int 43h pointer on overlay load
-   330 0000001A ????????????????    <1>     .oldInt44h  resq 1  ;Int 44h pointer on overlay load
+   328 0000000A ????????????????    <1>     .oldInt22h  resq 1  ;Int 22h pointer on overlay load
+   329 00000012 ????????????????    <1>     .oldInt23h  resq 1  ;Int 23h pointer on overlay load
+   330 0000001A ????????????????    <1>     .oldInt24h  resq 1  ;Int 24h pointer on overlay load
    331 00000022 ????????????????    <1>     .parentPtr  resq 1  ;Pointer to parent process PSP
    332                              <1>     .externalJFTPtr:    ;Ptr to external JFT array (first byte AFTER MCB)
    333 0000002A <res 14h>           <1>     .jobFileTbl resb 20 ;Main File handle array, JFT
    334 0000003E ????????????????    <1>     .envPtr     resq 1  ;Pointer to the environment
-   335 00000046 ????????????????    <1>     .rspPtr     resq 1  ;Pointer to rsp on entry to Int 41h
+   335 00000046 ????????????????    <1>     .rspPtr     resq 1  ;Pointer to rsp on entry to Int 21h
    336 0000004E ????                <1>     .jftSize    resw 1  ;JFT array size, 20 => PSP JFT in use
    337 00000050 ??????              <1>     .unixEntry  resb 3  ;Must always be CDh 41h CBh, same place as DOS
    338 00000053 ????????????????    <1>     .prevPSP    resq 1  ;Pointer to the previous PSP in chain (used by SHARE)
@@ -811,7 +811,7 @@
     47                              <1> 
     48                              <1> errFilExist equ 80  ;File already exists
     49                              <1> errDirExist equ 82  ;Directory already exists
-    50                              <1> errFI44     equ 83  ;Fail on INT 44h
+    50                              <1> errFI44     equ 83  ;Fail on Int 24h
     51                              <1> errRedir    equ 84  ;Too many levels of redirection
     52                              <1> errDupRedir equ 85  ;Trying to redirect a redirection
     53                              <1> errBadPass  equ 86  ;Bad password
@@ -866,7 +866,7 @@
      5                              <1> .cVersion:
      6 00000005 50                  <1>     push rax
      7 00000006 B430                <1>     mov ah, 30h
-     8 00000008 CD41                <1>     int 41h
+     8 00000008 CD21                <1>     int 21h
      9 0000000A 3A05F2FFFFFF        <1>     cmp al, byte [.vNum] ;Version 1
     10 00000010 760D                <1>     jbe .okVersion
     11 00000012 58                  <1>     pop rax
@@ -892,14 +892,14 @@
     31 00000051 881586050000        <1>     mov byte [cmdDest], dl
     32                              <1>     ;Now get current drive
     33 00000057 B800190000          <1>     mov eax, 1900h  ;Get current drive as the source of the copy
-    34 0000005C CD41                <1>     int 41h
+    34 0000005C CD21                <1>     int 21h
     35 0000005E 0441                <1>     add al, "A" ;Convert to an ASCII char
     36 00000060 88052E050000        <1>     mov byte [biosFile], al
     37 00000066 880546050000        <1>     mov byte [dosFile], al
     38 0000006C 88055C050000        <1>     mov byte [cmdFile], al
     39                              <1> ;Now we check that the drive specified is a physical device
     40 00000072 B452                <1>     mov ah, 52h
-    41 00000074 CD41                <1>     int 41h ;Get in rbx a ptr to list of lists
+    41 00000074 CD21                <1>     int 21h ;Get in rbx a ptr to list of lists
     42 00000076 4881C32A000000      <1>     add rbx, 2Ah    ;Point rbx to cdsHeadPtr
     43 0000007D 488B33              <1>     mov rsi, qword [rbx]    ;Get the ptr to the CDS array
     44 00000080 0FB60DE0040000      <1>     movzx ecx, byte [sysDrive]
@@ -917,7 +917,7 @@
     56 000000A8 488D154F050000      <1>     lea rdx, rootDir
     57 000000AF B916000000          <1>     mov ecx, dirInclusive
     58 000000B4 B8004E0000          <1>     mov eax, 4E00h
-    59 000000B9 CD41                <1>     int 41h
+    59 000000B9 CD21                <1>     int 21h
     60 000000BB 7312                <1>     jnc .fileFound
     61 000000BD 2402                <1>     and al, 2   ;Clear the upper bit (turning errNoFil into errFnf)
     62 000000BF 3C02                <1>     cmp al, errFnf
@@ -931,7 +931,7 @@
     70 000000D6 807F0C08            <1>     cmp byte [rdi + ffBlock.attrib], dirVolumeID
     71 000000DA 75E7                <1>     jne .badRoot
     72 000000DC B8004F0000          <1>     mov eax, 4F00h  ;Find Next
-    73 000000E1 CD41                <1>     int 41h
+    73 000000E1 CD21                <1>     int 21h
     74 000000E3 73DE                <1>     jnc .badRoot    ;Another file found, exit bad
     75 000000E5 3C12                <1>     cmp al, errNoFil
     76 000000E7 75DA                <1>     jne .badRoot
@@ -940,7 +940,7 @@
     79 000000EA B8001C0000          <1>     mov eax, 1C00h  ;Get FAT information
     80 000000EF 8A1572040000        <1>     mov dl, byte [sysDrive]
     81 000000F5 FEC2                <1>     inc dl  ;Convert to 1 based number
-    82 000000F7 CD41                <1>     int 41h
+    82 000000F7 CD21                <1>     int 21h
     83 000000F9 66890D71040000      <1>     mov word [sectorSize], cx   ;Move the sector size in, use for buffer size
     84 00000100 88056D040000        <1>     mov byte [secPerClus], al   ;Save the number of sectors per cluster too
     85 00000106 891568040000        <1>     mov dword [clustCnt], edx   ;Save the count of clusters
@@ -975,10 +975,10 @@
    114                              <1> ;We close system handles here to update the DIR entries
    115 00000189 B8003E0000          <1>     mov eax, 3E00h
    116 0000018E 668B1DF5030000      <1>     mov bx, word [biosHdlDst]
-   117 00000195 CD41                <1>     int 41h
+   117 00000195 CD21                <1>     int 21h
    118 00000197 B8003E0000          <1>     mov eax, 3E00h
    119 0000019C 668B1DEB030000      <1>     mov bx, word [dosHdlDst]
-   120 000001A3 CD41                <1>     int 41h
+   120 000001A3 CD21                <1>     int 21h
    121                              <1> 
    122                              <1> ;Now also copy the default DOS command interpreter
    123 000001A5 488D3522040000      <1>     lea rsi, cmdNamePair
@@ -1095,9 +1095,9 @@
    234 00000316 E856000000          <1>     call freeResources
    235 0000031B 488D151E040000      <1>     lea rdx, okMsg
    236 00000322 B800090000          <1>     mov eax, 0900h
-   237 00000327 CD41                <1>     int 41h
+   237 00000327 CD21                <1>     int 21h
    238 00000329 B8004C0000          <1>     mov eax, 4C00h
-   239 0000032E CD41                <1>     int 41h
+   239 0000032E CD21                <1>     int 21h
    240                              <1> 
    241                              <1> badXfer:
    242 00000330 488D1D92030000      <1>     lea rbx, badMem
@@ -1113,12 +1113,12 @@
    252                              <1> badPrint:
    253                              <1> ;Generic Print entry point
    254 0000035E B800090000          <1>     mov eax, 0900h
-   255 00000363 CD41                <1>     int 41h
+   255 00000363 CD21                <1>     int 21h
    256                              <1> badExit:
    257                              <1> ;DOS will close the handles for us if needed
    258 00000365 E807000000          <1>     call freeResources
    259 0000036A B8FF4C0000          <1>     mov eax, 4CFFh
-   260 0000036F CD41                <1>     int 41h
+   260 0000036F CD21                <1>     int 21h
    261                              <1> 
    262                              <1> ;Utility functions
    263                              <1> freeResources:
@@ -1169,7 +1169,7 @@
     36                              <3> %%a:
     37                              <3>  %endif
    287 000003EE B800490000          <1>     mov eax, 4900h  ;Free block
-   288 000003F3 CD41                <1>     int 41h
+   288 000003F3 CD21                <1>     int 21h
    289                              <1>     return
     13                              <2> %%_ret:
     14 000003F5 C3                  <2>  ret
@@ -1197,7 +1197,7 @@
     36                              <3> %%a:
     37                              <3>  %endif
    292 000003F8 B8003E0000          <1>     mov eax, 3E00h
-   293 000003FD CD41                <1>     int 41h
+   293 000003FD CD21                <1>     int 21h
    294                              <1>     return
     13                              <2> %%_ret:
     14 000003FF C3                  <2>  ret
@@ -1212,7 +1212,7 @@
    302                              <1> ;   If CF=CY and esi = 0, error on create, else error on open
    303 00000400 4889F2              <1>     mov rdx, rsi
    304 00000403 B8003D0000          <1>     mov eax, 3D00h  ;Open in Read-Only mode
-   305 00000408 CD41                <1>     int 41h
+   305 00000408 CD21                <1>     int 21h
    306                              <1>     retc
     57                              <2> cret c
     19                              <3> %%_base:
@@ -1241,7 +1241,7 @@
    311 00000415 31F6                <1>     xor esi, esi    ;Indicate we are in the create phase now
    312 00000417 0FB6CB              <1>     movzx ecx, bl
    313 0000041A B8003C0000          <1>     mov eax, 3C00h
-   314 0000041F CD41                <1>     int 41h
+   314 0000041F CD21                <1>     int 21h
    315                              <1>     retc
     57                              <2> cret c
     19                              <3> %%_base:
@@ -1282,7 +1282,7 @@
    329 00000434 0FB71D36010000      <1>     movzx ebx, word [sectorSize]
    330 0000043B C1EB04              <1>     shr ebx, 4  ;Convert to paragraphs
    331 0000043E B800480000          <1>     mov eax, 4800h
-   332 00000443 CD41                <1>     int 41h
+   332 00000443 CD21                <1>     int 21h
    333 00000445 B9FFFFFFFF          <1>     mov ecx, -1
    334                              <1>     retc    ;Return if error
     57                              <2> cret c
@@ -1312,7 +1312,7 @@
    339 00000456 668B1E              <1>     mov bx, word [rsi]  ;Get source file read
    340 00000459 0FB70D11010000      <1>     movzx ecx, word [sectorSize]   
    341 00000460 B8003F0000          <1>     mov eax, 3F00h  ;Read handle
-   342 00000465 CD41                <1>     int 41h
+   342 00000465 CD21                <1>     int 21h
    343                              <1>     retc    ;Return if error
     57                              <2> cret c
     19                              <3> %%_base:
@@ -1338,7 +1338,7 @@
    345 0000046D 89C1                <1>     mov ecx, eax    ;Move the number of bytes to write into ecx
    346 0000046F 89C7                <1>     mov edi, eax    ;Keep a copy for later
    347 00000471 B800400000          <1>     mov eax, 4000h  ;Write handle
-   348 00000476 CD41                <1>     int 41h
+   348 00000476 CD21                <1>     int 21h
    349                              <1>     retc
     57                              <2> cret c
     19                              <3> %%_base:
@@ -1514,7 +1514,7 @@
    440                              <1> ;rdx = Start LBA to read from
    441 00000523 8A053E000000        <1>     mov al, byte [sysDrive]     ; Always read from sysDrive
    442 00000529 488B1D38000000      <1>     mov rbx, qword [memoryBlock] ; Memory Buffer address to read from
-   443 00000530 CD45                <1>     int 45h
+   443 00000530 CD25                <1>     int 25h
    444 00000532 58                  <1>     pop rax ;Pop old flags into rax
    445                              <1>     return
     13                              <2> %%_ret:
@@ -1527,7 +1527,7 @@
    450                              <1> ;rdx = Start LBA to write to
    451 00000534 8A052D000000        <1>     mov al, byte [sysDrive]     ; Always write to sysDrive
    452 0000053A 488B1D27000000      <1>     mov rbx, qword [memoryBlock] ; Memory Buffer address to read from
-   453 00000541 CD46                <1>     int 46h
+   453 00000541 CD26                <1>     int 26h
    454 00000543 58                  <1>     pop rax ;Pop old flags into rax
    455                              <1>     return
     13                              <2> %%_ret:
@@ -1538,7 +1538,7 @@
    458 00000545 C60524000000FF      <1>     mov byte [inCrit], -1
    459 0000054C 50                  <1>     push rax 
    460 0000054D B801800000          <1>     mov eax, 8001h
-   461 00000552 CD4A                <1>     int 4ah
+   461 00000552 CD2A                <1>     int 2ah
    462 00000554 58                  <1>     pop rax
    463                              <1>     return
     13                              <2> %%_ret:
@@ -1548,7 +1548,7 @@
    465                              <1> dosCrit1Exit:
    466 00000556 50                  <1>     push rax 
    467 00000557 B801810000          <1>     mov eax, 8101h
-   468 0000055C CD4A                <1>     int 4ah
+   468 0000055C CD2A                <1>     int 2ah
    469 0000055E 58                  <1>     pop rax
    470 0000055F C6050A00000000      <1>     mov byte [inCrit], 0
    471                              <1>     return

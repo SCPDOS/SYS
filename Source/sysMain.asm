@@ -5,7 +5,7 @@ startSys:
 .cVersion:
     push rax
     mov ah, 30h
-    int 41h
+    int 21h
     cmp al, byte [.vNum] ;Version 1
     jbe .okVersion
     pop rax
@@ -31,14 +31,14 @@ startSys:
     mov byte [cmdDest], dl
     ;Now get current drive
     mov eax, 1900h  ;Get current drive as the source of the copy
-    int 41h
+    int 21h
     add al, "A" ;Convert to an ASCII char
     mov byte [biosFile], al
     mov byte [dosFile], al
     mov byte [cmdFile], al
 ;Now we check that the drive specified is a physical device
     mov ah, 52h
-    int 41h ;Get in rbx a ptr to list of lists
+    int 21h ;Get in rbx a ptr to list of lists
     add rbx, 2Ah    ;Point rbx to cdsHeadPtr
     mov rsi, qword [rbx]    ;Get the ptr to the CDS array
     movzx ecx, byte [sysDrive]
@@ -56,7 +56,7 @@ startSys:
     lea rdx, rootDir
     mov ecx, dirInclusive
     mov eax, 4E00h
-    int 41h
+    int 21h
     jnc .fileFound
     and al, 2   ;Clear the upper bit (turning errNoFil into errFnf)
     cmp al, errFnf
@@ -70,7 +70,7 @@ startSys:
     cmp byte [rdi + ffBlock.attrib], dirVolumeID
     jne .badRoot
     mov eax, 4F00h  ;Find Next
-    int 41h
+    int 21h
     jnc .badRoot    ;Another file found, exit bad
     cmp al, errNoFil
     jne .badRoot
@@ -79,7 +79,7 @@ startSys:
     mov eax, 1C00h  ;Get FAT information
     mov dl, byte [sysDrive]
     inc dl  ;Convert to 1 based number
-    int 41h
+    int 21h
     mov word [sectorSize], cx   ;Move the sector size in, use for buffer size
     mov byte [secPerClus], al   ;Save the number of sectors per cluster too
     mov dword [clustCnt], edx   ;Save the count of clusters
@@ -114,10 +114,10 @@ startSys:
 ;We close system handles here to update the DIR entries
     mov eax, 3E00h
     mov bx, word [biosHdlDst]
-    int 41h
+    int 21h
     mov eax, 3E00h
     mov bx, word [dosHdlDst]
-    int 41h
+    int 21h
 
 ;Now also copy the default DOS command interpreter
     lea rsi, cmdNamePair
@@ -234,9 +234,9 @@ exit:
     call freeResources
     lea rdx, okMsg
     mov eax, 0900h
-    int 41h
+    int 21h
     mov eax, 4C00h
-    int 41h
+    int 21h
 
 badXfer:
     lea rbx, badMem
@@ -252,12 +252,12 @@ badHandle:
 badPrint:
 ;Generic Print entry point
     mov eax, 0900h
-    int 41h
+    int 21h
 badExit:
 ;DOS will close the handles for us if needed
     call freeResources
     mov eax, 4CFFh
-    int 41h
+    int 21h
 
 ;Utility functions
 freeResources:
@@ -285,12 +285,12 @@ freeResources:
     test r8, r8
     retz
     mov eax, 4900h  ;Free block
-    int 41h
+    int 21h
     return
 freeHandle:
     retz    ;Return if equal
     mov eax, 3E00h
-    int 41h
+    int 21h
     return
 
 openFiles:
@@ -302,7 +302,7 @@ openFiles:
 ;   If CF=CY and esi = 0, error on create, else error on open
     mov rdx, rsi
     mov eax, 3D00h  ;Open in Read-Only mode
-    int 41h
+    int 21h
     retc
     mov word [rdi], ax  ;Place it in the source handle
 
@@ -311,7 +311,7 @@ openFiles:
     xor esi, esi    ;Indicate we are in the create phase now
     movzx ecx, bl
     mov eax, 3C00h
-    int 41h
+    int 21h
     retc
     mov word [rdi + 2], ax  ;Place it in the destination handle
     return
@@ -329,7 +329,7 @@ copyFile:
     movzx ebx, word [sectorSize]
     shr ebx, 4  ;Convert to paragraphs
     mov eax, 4800h
-    int 41h
+    int 21h
     mov ecx, -1
     retc    ;Return if error
     mov qword [memoryBlock], rax    ;Save the ptr here
@@ -339,13 +339,13 @@ copyFile:
     mov bx, word [rsi]  ;Get source file read
     movzx ecx, word [sectorSize]   
     mov eax, 3F00h  ;Read handle
-    int 41h
+    int 21h
     retc    ;Return if error
     mov bx, word [rsi + 2]
     mov ecx, eax    ;Move the number of bytes to write into ecx
     mov edi, eax    ;Keep a copy for later
     mov eax, 4000h  ;Write handle
-    int 41h
+    int 21h
     retc
     cmp ecx, edi    ;Did we write the same as we read?
     jne .badExit
@@ -440,7 +440,7 @@ readSector:
 ;rdx = Start LBA to read from
     mov al, byte [sysDrive]     ; Always read from sysDrive
     mov rbx, qword [memoryBlock] ; Memory Buffer address to read from
-    int 45h
+    int 25h
     pop rax ;Pop old flags into rax
     return
 writeSector:
@@ -450,7 +450,7 @@ writeSector:
 ;rdx = Start LBA to write to
     mov al, byte [sysDrive]     ; Always write to sysDrive
     mov rbx, qword [memoryBlock] ; Memory Buffer address to read from
-    int 46h
+    int 26h
     pop rax ;Pop old flags into rax
     return
 
@@ -458,14 +458,14 @@ dosCrit1Enter:
     mov byte [inCrit], -1
     push rax 
     mov eax, 8001h
-    int 4ah
+    int 2ah
     pop rax
     return
 
 dosCrit1Exit:
     push rax 
     mov eax, 8101h
-    int 4ah
+    int 2ah
     pop rax
     mov byte [inCrit], 0
     return
