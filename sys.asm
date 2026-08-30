@@ -24,13 +24,13 @@
 
 ;Called with SYS X: where X is the drive we want to install System files on
 
-[map all ./Listings/sys.map]
+[map all ./lst/sys.map]
 [DEFAULT REL]
 BITS 64
-%include "./Include/dosMacro.mac"
-%include "./Include/dosStruc.inc"
-%include "./Include/fatStruc.inc"
-%include "./Include/dosError.inc"
+%include "./inc/dosMacro.mac"
+%include "./inc/dosStruc.inc"
+%include "./inc/fatStruc.inc"
+%include "./inc/dosError.inc"
 
 struc sysInitTableStruc
     .length     resb 1
@@ -41,5 +41,5 @@ struc sysInitTableStruc
     .bootable   resb 1  ;Flag to indicate bootable
 endstruc
 
-%include "./Source/sysMain.asm"
-%include "./Data/sysData.asm"
+%include "./src/sysMain.asm"
+%include "./data/sysData.asm"

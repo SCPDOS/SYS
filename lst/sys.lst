@@ -1,0 +1,1746 @@
+     1                                  ;Installs DOS onto a target Disk. Copies system files and a command interpreter
+     2                                  ;Also sets the byte in the VBR to bootable once everything is copied over.
+     3                                  
+     4                                  ;1) Check Root Dir has no entries in it (ignoring Volume Labels)
+     5                                  ;2) Search for the boot files in the root dir of current drive.
+     6                                  ;3) If the boot files are found, read them both into memory.
+     7                                  ;4) Write them onto the target medium root dir and close the handles.
+     8                                  ;5) Enter a critical section and direct IO read sector 0 of the volume
+     9                                  ;6) Set the bootable flag to on and fix the SCP/BIOS struct data for 
+    10                                  ;    SCP/BIOS.SYS and SCP/DOS.SYS.
+    11                                  ;7) Write back to disk, Exit critical section and exit.
+    12                                  
+    13                                  ;SYS needs to set the startSector (QWORD) and numberOfSectors (WORD) as 
+    14                                  ; well as the transfer packet.
+    15                                  ;The first is to locate a copy of SCPBIOS somewhere on the disk (can be
+    16                                  ; in another volume).
+    17                                  ;The second is tho locate SCPDOS to load after SCPBIOS is complete and 
+    18                                  ; resident.
+    19                                  
+    20                                  ;startSector and numberOfSectors are always placed in that order
+    21                                  ; directly AFTER the BPB (or BPB32, please check which FAT type we are).
+    22                                  ;The transfer packet is always located before the boot switch byte.
+    23                                  ;The boot switch byte is always located before the boot signature.
+    24                                  
+    25                                  ;Called with SYS X: where X is the drive we want to install System files on
+    26                                  
+    27                                  [map all ./lst/sys.map]
+    28                                  [DEFAULT REL]
+    29                                  BITS 64
+    30                                  %include "./inc/dosMacro.mac"
+     1                              <1> 
+     2                              <1> ;-------------------------------------------------------------------------------
+     3                              <1> ;Generic Macros file
+     4                              <1> ;The following instruction extensions allow to conditionally return
+     5                              <1> ;The idea was borrowed from the DOS Source Code
+     6                              <1> ;
+     7                              <1> ;-------------------------------------------------------------------------------
+     8                              <1> 
+     9                              <1> ;-------------------------------------------------------------------------------
+    10                              <1> ;These macros are live and must not be touched
+    11                              <1> ;-------------------------------------------------------------------------------
+    12                              <1> %macro return 0
+    13                              <1> %%_ret:
+    14                              <1>     ret
+    15                              <1> %assign retOff %%_ret-$$  ;Get offset into segment of %%_ret
+    16                              <1> %endmacro
+    17                              <1> 
+    18                              <1> %macro cret 1
+    19                              <1> %%_base:
+    20                              <1> %assign baseVar %%_base-$$ ;Get offset into segment of %%_base
+    21                              <1>     %ifdef retOff
+    22                              <1>     %if (baseVar - retOff <= 126) && (baseVar > retOff)
+    23                              <1>     %ifdef currSegVBase
+    24                              <1>     j%+1 short (retOff+currSegVBase)
+    25                              <1>     %else
+    26                              <1>     j%+1 short retOff
+    27                              <1>     %endif  ;End ifdef currSegVBase
+    28                              <1>     %else 
+    29                              <1>     j%-1 short %%a
+    30                              <1>     return
+    31                              <1> %%a:
+    32                              <1>     %endif  ;End the distance measurement if
+    33                              <1>     %else   
+    34                              <1>     j%-1 short %%a
+    35                              <1>     return
+    36                              <1> %%a:
+    37                              <1>     %endif  ;End ifdef retoff
+    38                              <1> %endmacro
+    39                              <1> 
+    40                              <1> %macro retz 0
+    41                              <1> cret z
+    42                              <1> %endmacro
+    43                              <1> 
+    44                              <1> %macro retnz 0
+    45                              <1> cret nz
+    46                              <1> %endmacro
+    47                              <1> 
+    48                              <1> %macro rete 0
+    49                              <1> cret e
+    50                              <1> %endmacro
+    51                              <1> 
+    52                              <1> %macro retne 0
+    53                              <1> cret ne
+    54                              <1> %endmacro
+    55                              <1> 
+    56                              <1> %macro retc 0
+    57                              <1> cret c
+    58                              <1> %endmacro
+    59                              <1> 
+    60                              <1> %macro retnc 0
+    61                              <1> cret nc
+    62                              <1> %endmacro
+    63                              <1> 
+    64                              <1> %macro retb 0
+    65                              <1> cret b
+    66                              <1> %endmacro
+    67                              <1> 
+    68                              <1> %macro retnb 0
+    69                              <1> cret nb
+    70                              <1> %endmacro
+    71                              <1> 
+    72                              <1> %macro reta 0
+    73                              <1> cret a
+    74                              <1> %endmacro
+    75                              <1> 
+    76                              <1> %macro retna 0
+    77                              <1> cret na
+    78                              <1> %endmacro
+    79                              <1> 
+    80                              <1> %macro breakpoint 0
+    81                              <1> xchg bx, bx
+    82                              <1> %endmacro
+    31                                  %include "./inc/dosStruc.inc"
+     1                              <1> 
+     2                              <1> ;-------------------------------------------------------;
+     3                              <1> ; This include file contains miscellaneous internal     ;
+     4                              <1> ; SCP/DOS structures.                                   ;
+     5                              <1> ;-------------------------------------------------------;
+     6                              <1> 
+     7                              <1> ;File/path length equates.
+     8                              <1> MAX_FNAME_FCB   equ 8
+     9                              <1> MAX_EXT_FCB     equ 3
+    10                              <1> MAX_NAME_FCB    equ MAX_FNAME_FCB + MAX_EXT_FCB
+    11                              <1> MAX_NAME_FCBZ   equ MAX_NAME_FCB + 1    ;Space for a null terminator
+    12                              <1> ;Values below include the null terminator.
+    13                              <1> MAX_FILE    equ 13  ;Maximum length of a filename (includes dot)
+    14                              <1> MAX_DRIVE   equ 3   ;Maximum length of a drive string (X:<NUL>)
+    15                              <1> MAX_FSPEC   equ 64  ;Maximum length of a path to a file (filespec)
+    16                              <1> MAX_PATH    equ 67  ;Maximum length of a fully qualified pathspec
+    17                              <1> ;MAX_PATH is X:\<string, maxlen 63 chars>,<null> so 67 chars total.
+    18                              <1> ;Use this symbol to check the length of a filename after qualification.
+    19                              <1> MAX_PSPEC   equ MAX_PATH - MAX_FILE - 1 ;54 bytes
+    20                              <1> ;MAX_PSPEC is the max length of a path with space for a filename!
+    21                              <1> ;Remember, filenames for us are just a string of, at most, 13 characters,
+    22                              <1> ; which we always resolve into FCB format. Buffers need to make space for
+    23                              <1> ; both the dot and terminating null
+    24                              <1> ;------------------------------------------------------------------------;
+    25                              <1> ; Each mass storage device up to LASTDRIVE gets a DPB, describing 
+    26                              <1> ; its file system structure. This is used to locate files and structures
+    27                              <1> ; on the device itself and to translate file requests to cluster chains
+    28                              <1> ; to LBAs to pass to the disk driver..
+    29                              <1> ; The DPBs form a linked list, with each DPB formed after the devices 
+    30                              <1> ; drivers Initialise routine has been called.
+    31                              <1> ;------------------------------------------------------------------------;
+    32                              <1> struc dpb        ;Drive Parameter Block
+    33                              <1> 
+    34 00000000 ??                  <1>     .bDriveNumber           db ?  ;Drive number (0=A, 1=B ...)
+    35 00000001 ??                  <1>     .bUnitNumber            db ?  ;Unit number in device
+    36 00000002 ????                <1>     .wBytesPerSector        dw ?  ;min 512, max 4096
+    37 00000004 ??                  <1>     .bMaxSectorInCluster    db ?  ;(Maximum sector in cluster) - 1
+    38 00000005 ??                  <1>     .bSecPerClustShift      db ?  ;Sectors per cluster exponent
+    39 00000006 ????                <1>     .wFAToffset             dw ?  ;Number of reserved sectors in partition
+    40 00000008 ??                  <1>     .bNumberOfFATs          db ?  ;Number of FATs
+    41 00000009 ????                <1>     .wNumberRootDirEntries  dw ?  ;In 32 byte units, this is 0 for FAT32
+    42 0000000B ????????            <1>     .dClusterHeapOffset     dd ?  ;Start sector of data area
+    43 0000000F ????????            <1>     .dMaxClusterAddr        dd ?  ;Max Cluster Addr = # of data clusters + 1
+    44 00000013 ????????            <1>     .dFATlength             dd ?  ;FAT length, in sectors
+    45 00000017 ????????            <1>     .dFirstUnitOfRootDir    dd ?  
+    46                              <1>     ;Unit=Sector/Cluster of Root Directory (FAT12/16 = Sector, FAT32 = Cluster)
+    47 0000001B ????????????????    <1>     .qDriverHeaderPtr       dq ?  ;Pointer to device driver header
+    48 00000023 ??                  <1>     .bMediaDescriptor       db ?  ;Media descriptor
+    49 00000024 ??                  <1>     .bAccessFlag            db ?  ;Access Flag (0 if accessed, else -1)
+    50 00000025 ????????????????    <1>     .qNextDPBPtr            dq ?  ;Pointer to next DPB, -1 if at end
+    51 0000002D ????????            <1>     .dNextFreeClst          dd ?  ;Starting cluster of free space search
+    52 00000031 ????????            <1>     .dFreeClustCnt          dd ?  ;Number of free clusters, -1 unknown
+    53                              <1> 
+    54                              <1> endstruc
+    55                              <1> 
+    56                              <1> fat12MaxClustCnt    equ 4085    ;Cluster count less than this is FAT12
+    57                              <1> fat16MaxClustCnt    equ 65525   ;Cluster count less than this is FAT16
+    58                              <1> ;------------------------------------------------------------------------;
+    59                              <1> ; Each mass storage device up to LASTDRIVE has a CDS associated with it.
+    60                              <1> ; All disk pathing requests go via the CDS for that drive.
+    61                              <1> ; The default drive is the last accessed drive, this number is stored
+    62                              <1> ; in the DOS data area.
+    63                              <1> ; The CDS is stored as an array with the offset into the array being 
+    64                              <1> ; given by the drive letter's offset into the alphabet (with A=0).
+    65                              <1> ;
+    66                              <1> ; DEFAULT LASTDRIVE=E, MINIMUM LASTDRIVE=B
+    67                              <1> ;------------------------------------------------------------------------;
+    68                              <1> struc cds       ;Current Directory structure
+    69 00000000 <res 43h>           <1>     .sCurrentPath        db MAX_PATH dup (?)    ;Current Directory Path String
+    70 00000043 ????                <1>     .wFlags              dw ?   ;CDS Flags - 
+    71 00000045 ????????????????    <1>     .qDPBPtr             dq ?   ;Ptr to the DPB of the dev using this CDS
+    72 0000004D ????????            <1>     .dStartCluster       dd ?   ;Starting cluster of the directory on disk
+    73 00000051 ????????????????    <1>     .qIFSPtr             dq ?   ;Reserved for IFS driver expansions
+    74 00000059 ????????            <1>     .dNetStore           dd ?   ;For storing a owner dword for IFS (21h/5F03h)
+    75 0000005D ????                <1>     .wBackslashOffset    dw ?   ;How many chars to skip for getting the path
+    76                              <1> ; currentPath (usually 2 to skip C: in C:\, but when SUBSTing a drive letter to 
+    77                              <1> ; another, we save the number of chars to skip to that deep level).
+    78                              <1> ; I.E. if we SUBST A:\DOS G: then this value for the CDS for drive G is 6
+    79                              <1> ; Only affects for SUBST drives, not JOIN
+    80                              <1> ; Flags: Bit 15 set = Network drive
+    81                              <1> ;        Bit 14 set = Physical drive
+    82                              <1> ;        Bit 13 set = JOIN'ed drive
+    83                              <1> ;        Bit 12 set = SUBST'ed drive
+    84                              <1> ;        Bit 7  set = Redirected, not net. drive (This is how MSCDEX worked)
+    85                              <1> endstruc
+    86                              <1> ;CDS equates
+    87                              <1> cdsRedirDrive   equ 8000h   ;All drives which use the Redirector interface
+    88                              <1> cdsValidDrive   equ 4000h   ;CDS valid
+    89                              <1> cdsJoinDrive    equ 2000h   ;CDS for joined drives
+    90                              <1> cdsSubstDrive   equ 1000h   ;Drives formed by Subst
+    91                              <1> cdsRdirLocDrive equ 0080h   ;Redirector but Local
+    92                              <1> ;------------------------------------------------------------------------;
+    93                              <1> ; The SFT is a way to allow applications to open file handles to files 
+    94                              <1> ; and devices. As things stand, the SFT chain will have 5 file handles
+    95                              <1> ; under the first header, and then a second header will be linked to the 
+    96                              <1> ; first one after CONFIG.SYS has been read, to allow for FILES= to specify
+    97                              <1> ; a size for the second SFT (default 10 files). Same for System FCBs, 
+    98                              <1> ; using the FCBS= command. Default FCBS=5.
+    99                              <1> ;
+   100                              <1> ; A file handle describes the file, and the location within the file that
+   101                              <1> ; we are reading. The file handle can be manipulated without the file
+   102                              <1> ; being in memory, thus allowing the user to access data without needing 
+   103                              <1> ; to take up large portions of memory. Similarly, file handles allow for
+   104                              <1> ; accessing devices, by treating them as files with their drivers 
+   105                              <1> ; responding and translating the manipulations of the file handle itself.
+   106                              <1> ; Neither the driver nor the application should see or use the SFT for
+   107                              <1> ; the handle, as it is subject to change (and will change when file 
+   108                              <1> ; sharing provisions are included). The DOS will make requests to the 
+   109                              <1> ; driver in a generic way and the driver will respond, with DOS keeping
+   110                              <1> ; track of the information in the SFT entry for that handle. 
+   111                              <1> ;
+   112                              <1> ; One SFT entry can have multiple handles and multiple SFT entries
+   113                              <1> ; can point to the same file. It all depends on what the applications 
+   114                              <1> ; want to do with the File.
+   115                              <1> ;
+   116                              <1> ; !!!!IMPORTANT!!!!
+   117                              <1> ; Currently there are plans for File Sharing, but I include minimal 
+   118                              <1> ; provisions for it. I really just wanna get a DOS out the door.
+   119                              <1> ;
+   120                              <1> ;Each SFT may look like this:
+   121                              <1> ;sysvars-->sfth------------>sfth------------>|ENDOFLIST|
+   122                              <1> ;            |                |
+   123                              <1> ;       wNumFiles*sft    wNumFiles*sft
+   124                              <1> ;
+   125                              <1> ; Two SFT chains are built; one for files, and a one for so called 
+   126                              <1> ; System FCBs.
+   127                              <1> ;
+   128                              <1> ; Each SFT header has an array of SFT's below it, with the number of 
+   129                              <1> ; SFTs given by wNumFiles. The SFT headers form a linked list.
+   130                              <1> ;
+   131                              <1> ; DEFAULT FILES=8, MINIMUM FILES=5
+   132                              <1> ; DEFAULT FCBS=5,  MINIMUM FCBS=5
+   133                              <1> ;------------------------------------------------------------------------;
+   134                              <1> struc sfth   ;System file table header
+   135                              <1> ; This is the SFT header.
+   136                              <1> ; This structure comes before the start of the first file in the array/table.
+   137 00000000 ????????????????    <1>     .qNextSFTPtr dq ?    ;Pointer to the next SFT
+   138 00000008 ????                <1>     .wNumFiles   dw ?    ;Number of files in this table
+   139                              <1> endstruc
+   140                              <1> 
+   141                              <1> struc sft
+   142                              <1> ;This is the file struc itself
+   143 00000000 ????                <1>     .wNumHandles dw ?    ;Number of handles pointing to this file
+   144 00000002 ????                <1>     .wOpenMode   dw ?    ;File access permissions and behaviours
+   145 00000004 ??                  <1>     .bFileAttrib db ?    ;Regular File Attributes
+   146 00000005 ????                <1>     .wDeviceInfo dw ?    ;Includes unit number if a block device
+   147 00000007 ????????????????    <1>     .qPtr        dq ?    ;IF char, ptr to device driver header, ELSE DPBptr
+   148 0000000F ????????            <1>     .dStartClust dd ?    ;Start cluster of file pointed to by SFT entry
+   149                              <1> .dTimeDate:              ;Symbol to access time/date together
+   150 00000013 ????                <1>     .wTime       dw ?    ;File Time, updated on open and writes
+   151 00000015 ????                <1>     .wDate       dw ?    ;File Date, updated on open and writes
+   152 00000017 ????????            <1>     .dFileSize   dd ?    ;File Size, in bytes
+   153 0000001B ????????            <1>     .dCurntOff   dd ?    ;Current Offset pointed to by SFT entry, in bytes
+   154 0000001F ????????            <1>     .dRelClust   dd ?    ;File relative cluster pointed to by SFT entry
+   155 00000023 ????????            <1>     .dAbsClust   dd ?    ;Absolute disk cluster pointed to by SFT entry
+   156 00000027 ????????????????    <1>     .qDirSect    dq ?    ;Abs number of sector containing directory entry 
+   157 0000002F ??                  <1>     .bNumDirEnt  db ?    ;Directory entry within dir sector (byte offset/32)
+   158 00000030 <res Bh>            <1>     .sFileName   db 11 dup (?)   ;8.3 Filename
+   159                              <1> ;                       Share Vars
+   160 0000003B ????????????????    <1>     .pNextSFT   dq ?    ;Ptr to the next SFT for this file in the chain
+   161 00000043 ????????            <1>     .dMID       dd ?    ;Machine ID of the machine (VM) that opened this file
+   162 00000047 ????????????????    <1>     .qPID       dq ?    ;Proc ID (PSP) of the program which opened this file
+   163 0000004F ????????????????    <1>     .pMFT       dq ?    ;Pointer to the MFT for this file. 0 means no MFT
+   164                              <1> endstruc
+   165                              <1> ;Open Mode equates
+   166                              <1> ;Access modes   Bits[2:0]
+   167                              <1> openRdAcc   equ 0h
+   168                              <1> openWrAcc   equ 1h
+   169                              <1> openRWAcc   equ 2h
+   170                              <1> ;Bit 3 reserved 0
+   171                              <1> ;Sharing modes  Bits[6:4]
+   172                              <1> openCompat      equ 0h  ;Deny all, compatibility mode
+   173                              <1> openDenRWShr    equ 10h ;Deny all, explicity read/write
+   174                              <1> openDenWrShr    equ 20h ;Deny writes
+   175                              <1> openDenRdShr    equ 30h ;Deny reads
+   176                              <1> openDenNoShr    equ 40h ;Don't deny anything!
+   177                              <1> ;NetFCB is for files open by a local server, handling IO from a remote
+   178                              <1> ; client by proxy opened by an FCB! Sets the Net bit to indicate this. 
+   179                              <1> ;Thus, this is a handle with no JFT entry! Server handles its own JFT!
+   180                              <1> openNetFCBShr   equ 70h
+   181                              <1> openNoInherit   equ 80h
+   182                              <1> 
+   183                              <1> ;Bits 8-12 reserved 0
+   184                              <1> ;The next two are extended open mode bits! 
+   185                              <1> ;Can be set
+   186                              <1> openFailOnI24   equ 2000h   ;If set, automatically FAIL all Int 24h
+   187                              <1> openFlushWrites equ 4000h   ;If set, commit after each write call.
+   188                              <1> ;SFT-FCBs mark that the SFT is indeed an FCB on the System FCB chain.
+   189                              <1> ;These would only come into effect due to SHARE. We are yet to implement 
+   190                              <1> ; them
+   191                              <1> openSFTFCB      equ 8000h   ;If set, file is SFT-FCB.
+   192                              <1> 
+   193                              <1> ;Attribute Byte
+   194                              <1> attrFileRO          equ 1h
+   195                              <1> attrFileHidden      equ 2h
+   196                              <1> attrFileSys         equ 4h
+   197                              <1> attrFileVolLbl      equ 8h
+   198                              <1> attrFileDir         equ 10h ;Directory entry
+   199                              <1> attrFileArchive     equ 20h
+   200                              <1> attrFileChar        equ 40h ;Reserved, never found in dir
+   201                              <1> 
+   202                              <1> ;Device Info word equates
+   203                              <1> ;For a block device, bits [5:0] contain the drive number
+   204                              <1> devCharConIn    equ 1h  ;If set, device is CON input
+   205                              <1> devCharConOut   equ 2h  ;If set, device is CON output
+   206                              <1> devCharNulDev   equ 4h  ;If set, device is NULL device
+   207                              <1> devCharClkDev   equ 8h  ;If set, device is CLOCK device
+   208                              <1> 
+   209                              <1> devCharFastOut  equ 10h ;If set, device supports INT 29h
+   210                              <1> devCharBinary   equ 20h ;If set, r/w char device in Binary mode
+   211                              <1> devCharNotEOF   equ 40h ;If set, device not yet at end of file
+   212                              <1> devDiskNoFlush  equ 40h ;Set if file is synchronised with hard store!
+   213                              <1> devCharDev      equ 80h ;If set, it is a char device!
+   214                              <1> 
+   215                              <1> devDiskI24onFull    equ 100h    ;If set, Int 24h on disk full or disk EOF
+   216                              <1> devCharNetSpool equ 800h    ;If set, device is a network spooler
+   217                              <1> 
+   218                              <1> devNoInherit    equ 1000h   ;If set, handle not inherited by child processes
+   219                              <1> devCharNamePipe equ 2000h   ;If set, device is a named pipe
+   220                              <1> devDiskNoDTonClose equ 4000h   ;If set, dont update date and time when closing
+   221                              <1> devRedir        equ 8000h   ;If set, dev/file is redirected!
+   222                              <1> 
+   223                              <1> ;Extended open flags. For the var [wEOFlags]
+   224                              <1> ;These are not related to the SFT but are used during an extended open
+   225                              <1> ; call to keep track of whats going on and thus help build an SFT.
+   226                              <1> eoInExtOpen     equ 0001h   ;Doing Extended Open
+   227                              <1> eoFailI24       equ 0002h   ;If EO file hard fails, skip and fail Int 24h
+   228                              <1> eoFileNoExist   equ 0004h   ;File doesnt exist
+   229                              <1> 
+   230                              <1> ;Can combine the third option with one of the first two options.
+   231                              <1> ;The first two options cannot be combined.
+   232                              <1> ; - If only create is selected, then we try to do a create new. If the 
+   233                              <1> ;       file exists, this fails with a "File exists" error.
+   234                              <1> ;       Acts like a normal create new call. (21/5Bh)
+   235                              <1> ;
+   236                              <1> ; - If only open is selected then we try to do an open. If the file doesn't
+   237                              <1> ;       doesn't exist, this fails with a "File not found" error.
+   238                              <1> ;       Acts like a normal open call. (21/3Dh)
+   239                              <1> ;
+   240                              <1> ; - If only truncate is selected then we try to do a create. If the file
+   241                              <1> ;       doesn't exist, this fails a "File not found" error.
+   242                              <1> ;       New behaviour.
+   243                              <1> ;
+   244                              <1> ; - If open and create are selected then we try and open the file. If 
+   245                              <1> ;       the open fails due to the file not existing, we create a new file. 
+   246                              <1> ;       New behaviour.
+   247                              <1> ;
+   248                              <1> ; - If truncate and create are selected then we try to truncate the file. 
+   249                              <1> ;       If the file doesnt exist then we create a new file instead.
+   250                              <1> ;       Acts like a normal create call. (21/3Ch)
+   251                              <1> 
+   252                              <1> eoActOpen       equ 01h ;Open the file. 
+   253                              <1> eoActTruncate   equ 02h ;Truncate an existing file.
+   254                              <1> eoActCreate     equ 10h ;Create a file if one doesnt exist.
+   255                              <1> ;Extended Open Action Return 
+   256                              <1> eoRetActOpen    equ 1   ;Open existing
+   257                              <1> eoRetActCreate  equ 2   ;Create new and open
+   258                              <1> eoRetActTruncate    equ 3    ;Recreate and open
+   259                              <1> ;------------------------------------------------------------------------;
+   260                              <1> ; Buffers allow for buffered drive IO, by first transferring a sector 
+   261                              <1> ; to an internal buffer, and then copying it to the specified location
+   262                              <1> ; in memory. The buffer is kept in the buffer chain,  in the event that 
+   263                              <1> ; another request for the same sector from the same device is made, so 
+   264                              <1> ; that is can be read from the device directly. Buffers are uniform in 
+   265                              <1> ; size, selected according to the largest detected sector size during 
+   266                              <1> ; the initial loadup.
+   267                              <1> ;
+   268                              <1> ; The buffer pointer in SysVars points to most recently used Buffer
+   269                              <1> ;
+   270                              <1> ; DEFAULT BUFFERS=30, MINIMUM BUFFERS=2
+   271                              <1> ;------------------------------------------------------------------------;
+   272                              <1> 
+   273                              <1> struc bufferHdr
+   274 00000000 ????????????????    <1>     .nextBufPtr  dq  ?   ;Pointer to the next buffer in the chain or -1 at end
+   275                              <1>     .wDrvNumFlg:         ;Read as a word to get the following two bytes!
+   276 00000008 ??                  <1>     .driveNumber db  ?   ;Drive number the buffer is used for (or -1 for free)
+   277 00000009 ??                  <1>     .bufferFlags db  ?   ;Standard Flags
+   278 0000000A ????????????????    <1>     .bufferLBA   dq  ?   ;LBA the buffer contains
+   279 00000012 ??                  <1>     .bufFATcopy  db  ?   ;Number of copies of the FAT to write (1 if non-FAT)
+   280 00000013 ????????            <1>     .bufFATsize  dd  ?   ;Number of sectors per FAT (or 0 if non-FAT)
+   281 00000017 ????????????????    <1>     .driveDPBPtr dq  ?   ;Pointer to the device DPB block
+   282 0000001F ??                  <1>     .reserved    db  ?   ;Alignment byte
+   283                              <1>     .dataarea:             ;Points to the start of the data area
+   284                              <1> endstruc
+   285                              <1> ;Buffer Flag equates
+   286                              <1> dosBuffer   equ 1h  ;Sector 0 (BPB/VPB) in buffer
+   287                              <1> fatBuffer   equ 2h  ;FAT sector in buffer
+   288                              <1> dirBuffer   equ 4h  ;Directory sector in buffer
+   289                              <1> dataBuffer  equ 8h  ;File Data sector in buffer
+   290                              <1> refBuffer   equ 20h ;Data in buffer has been referenced by an application
+   291                              <1> dirtyBuffer equ 40h ;Data in buffer modified by an application
+   292                              <1> freeBuffer  equ 00FFh   ;A word which goes into the drive number to clear both fields
+   293                              <1> ;Note! A buffer is marked as referenced when the buffer is "obtained" by a syscall
+   294                              <1> ;------------------------------------------------------------------------;
+   295                              <1> ; Memory control block for each memory arena
+   296                              <1> ;------------------------------------------------------------------------;
+   297                              <1> struc mcb
+   298 00000000 ??                  <1>     .marker     db ?  ;M = Member of the MCB chain. Z = Last member
+   299 00000001 ????????????????    <1>     .owner      dq ?  ;Owning application PSP (para aligned) or 0 for free
+   300 00000009 ????????            <1>     .blockSize  dd ?  ;Number of contiguous paragraphs owned by this block
+   301                              <1>     ;The following byte is reserved outside of sysinit
+   302 0000000D ??                  <1>     .subSysMark db ?  ;Marks the optional DOS subsystem of the MCB
+   303 0000000E ????                <1>     .reserved   db 2 dup (?) 
+   304                              <1>     .program:
+   305                              <1> endstruc
+   306                              <1> ;MCB equates
+   307                              <1> mcbOwnerHole    equ 7   ;Owner = 7 => Memory hole, always fail free/realloc
+   308                              <1> mcbOwnerFree    equ 0   ;Owner = 0 => Free and available space
+   309                              <1> mcbOwnerDOS     equ 8   ;Owner = 8 => Owned by DOS
+   310                              <1> mcbOwnerNewDOS  equ 9   ;Owner = 9 => New Kernel driver alloc. Needs setting to 8.
+   311                              <1> mcbMarkCtn      equ "M"
+   312                              <1> mcbMarkEnd      equ "Z"
+   313                              <1> ;The following are used on MCB's that belong to DOS, that are not part of the
+   314                              <1> ; main kernel (i.e. the CONFIG.SYS optional parts).
+   315                              <1> mcbSubDriver    equ "D" ;Any memory allocated for a device driver's code.
+   316                              <1> mcbSubDrvExtra  equ "L" ;Any memory allocated by a device driver.
+   317                              <1> mcbSubDrvDPB    equ "P" ;Blocks used for DPB's are marked so.
+   318                              <1> mcbSubIFS       equ "I" ;Unused for now
+   319                              <1> mcbSubFiles     equ "F" ;Any memory allocated for Files.
+   320                              <1> mcbSubFCBS      equ "X" ;Unused for now
+   321                              <1> mcbSubBuffers   equ "B" ;Any memory allocated for Buffers.
+   322                              <1> mcbSubCDS       equ "L" ;Any memory allocated to store a CDS.
+   323                              <1> mcbSubStacks    equ "S" ;Unused for now
+   324                              <1> 
+   325                              <1> 
+   326                              <1> memFirstFit     equ 0   ;First free block goes to application
+   327                              <1> memBestFit      equ 1   ;Block whos size closest matches requirement
+   328                              <1> memLastFit      equ 2   ;Last free block goes to application
+   329                              <1> 
+   330                              <1> ;Owner = Para aligned address => Owning application PSP
+   331                              <1> ;...To consider...
+   332                              <1> ;Owner = Non-para aligned address => Error? Should maybe lock up system?
+   333                              <1> ;blockSize counts the number of paragraphs FROM .program TO THE NEXT MCB!
+   334                              <1> ;------------------------------------------------------------------------;
+   335                              <1> ; For Int 21h, the callers registers are saved on their stack in the 
+   336                              <1> ; following order, thus allowing for return values to be placed in the 
+   337                              <1> ; registers by accessing the caller register stack frame.
+   338                              <1> ;------------------------------------------------------------------------;
+   339                              <1> struc callerFrame
+   340 00000000 ????????????????    <1>     .rax    dq ?  ;Bottom of frame, pointer to rax saved in oldRSP
+   341 00000008 ????????????????    <1>     .rbx    dq ?    
+   342 00000010 ????????????????    <1>     .rcx    dq ?
+   343 00000018 ????????????????    <1>     .rdx    dq ?
+   344 00000020 ????????????????    <1>     .rsi    dq ?
+   345 00000028 ????????????????    <1>     .rdi    dq ?
+   346 00000030 ????????????????    <1>     .rbp    dq ?
+   347 00000038 ????????????????    <1>     .r8     dq ?  ;To be removed if truly not needed
+   348 00000040 ????????????????    <1>     .r9     dq ?
+   349                              <1> ;Pushed by Processor when invoked via Interrupt
+   350 00000048 ????????????????    <1>     .rip    dq ?
+   351 00000050 ????????????????    <1>     .cs     dq ?
+   352 00000058 ????????????????    <1>     .flags  dq ?
+   353                              <1> endstruc
+   354                              <1> 
+   355                              <1> struc dpl
+   356                              <1> ;DOS parameter list, pointer to this stack is passed to DOS in rdx on
+   357                              <1> ; server calls
+   358 00000000 ????????????????    <1>     .rax    dq ?
+   359 00000008 ????????????????    <1>     .rbx    dq ?
+   360 00000010 ????????????????    <1>     .rcx    dq ?
+   361 00000018 ????????????????    <1>     .rdx    dq ?
+   362 00000020 ????????????????    <1>     .rsi    dq ?
+   363 00000028 ????????????????    <1>     .rdi    dq ?
+   364 00000030 ????????????????    <1>     .r8     dq ?
+   365 00000038 ????????????????    <1>     .r9     dq ?
+   366 00000040 ????????????????    <1>     .align  dq ?
+   367 00000048 ????????????????    <1>     .dMID   dq ?  ;Machine id, low dword used only
+   368 00000050 ????????????????    <1>     .qPID   dq ?  ;Process ID
+   369                              <1> endstruc
+   370                              <1> 
+   371                              <1> struc cfgFrame  ;Frame used for config.sys parsing
+   372 00000000 ????????????????    <1>     .oldRBP         dq ?    ;Ptr to DOSSEG
+   373 00000008 ????????????????    <1>     .newBuffers     dq ?    ;New buffers value
+   374 00000010 ????????????????    <1>     .newSFTVal      dq ?
+   375 00000018 ????????????????    <1>     .newFCBSVal     dq ?
+   376 00000020 ????????????????    <1>     .newProtFCBSVal dq ?    ;Number of protected FCBS
+   377 00000028 ????????????????    <1>     .newLastdrive   dq ?
+   378 00000030 ????????????????    <1>     .newStacks      dq ?    ;Ignored for now
+   379 00000038 ????????????????    <1>     .newStackSize   dq ?    ;Ignored for now
+   380 00000040 ????????????????    <1>     .cfgHandle      dq ?    ;CONFIG.SYS handle
+   381 00000048 ????????????????    <1>     .lastLine       dq ?    ;Set if the last line is current
+   382 00000050 ????????????????    <1>     .linePtr        dq ?    ;Ptr to line buffer of line being processed
+   383 00000058 ????????????????    <1>     .driverBreak    dq ?    ;Ptr to the pathname terminator 
+   384 00000060 ????????????????    <1>     .breakChar      dq ?    ;Char that was replaced by null for terminator
+   385                              <1> endstruc
+   386                              <1> 
+   387                              <1> struc filename
+   388                              <1> ;8.3 File name struct
+   389 00000000 ????????????????    <1>     .fName  db 8 dup (?)
+   390 00000008 ??????              <1>     .fExt   db 3 dup (?)
+   391                              <1> endstruc
+   392                              <1> 
+   393                              <1> struc ffBlock   ;The structure of the Find First structure at the DTA
+   394 00000000 ??                  <1>     .driveNum   db ?  ;Drive we are searching on, 1 based number
+   395 00000001 <res Bh>            <1>     .template   db 11 dup (?) ;Search template (? meaning anything)
+   396 0000000C ??                  <1>     .attrib     db ?  ;Search attribute
+   397 0000000D ????????            <1>     .dirOffset  dd ?  ;32 byte entry within dir cluster
+   398 00000011 ????????            <1>     .parDirClus dd ?  ;Parent Directory Cluster number
+   399 00000015 ??                  <1>     .attribFnd  db ?  ;Attrib of file found
+   400 00000016 ????                <1>     .fileTime   dw ?  ;File time
+   401 00000018 ????                <1>     .fileDate   dw ?  ;File date
+   402 0000001A ????????            <1>     .fileSize   dd ?  ;Number of bytes
+   403 0000001E <res Dh>            <1>     .asciizName db 13 dup (?) ;ASCIIZ name with dot and terminating nul
+   404                              <1> endstruc
+   405                              <1> 
+   406                              <1> dfltJFTsize equ 20  ;Default size of PSP JFT
+   407                              <1> struc psp
+   408 00000000 ????                <1>     .return     db 2 dup (?)  ;Should always be CDh 20h, same place as DOS
+   409 00000002 ????????            <1>     .allocSize  dd ?  ;Number of paras in init alloc or when exiting as TSR.
+   410 00000006 ????????            <1>                 dd ?  ;Reserved 4 bytes
+   411 0000000A ????????????????    <1>     .oldInt22h  dq ?  ;Int 22h pointer on overlay load
+   412 00000012 ????????????????    <1>     .oldInt23h  dq ?  ;Int 23h pointer on overlay load
+   413 0000001A ????????????????    <1>     .oldInt24h  dq ?  ;Int 24h pointer on overlay load
+   414 00000022 ????????????????    <1>     .parentPtr  dq ?  ;Pointer to parent process PSP
+   415                              <1> ;If jftSize > 20, then the QWORD at .jobFileTbl becomes a pointer
+   416                              <1> ; to the actual in use JFT and the other 12 bytes are left undefined.
+   417                              <1> ;If jftSize < 20 (DOS will never set it so), then it is considered as 20
+   418                              <1> ;If the user tries to reduce handle count to 20 or less, then the PSP JFT is 
+   419                              <1> ; always used and jftSize.
+   420                              <1>     .externalJFTPtr:    ;Ptr to external JFT array (first byte AFTER MCB)
+   421 0000002A <res 14h>           <1>     .jobFileTbl db dfltJFTsize dup (?) ;Main File handle array, JFT
+   422 0000003E ????????????????    <1>     .envPtr     dq ?  ;Pointer to the environment
+   423 00000046 ????????????????    <1>     .rspPtr     dq ?  ;Pointer to rsp on entry to Int 21h
+   424 0000004E ????                <1>     .jftSize    dw ?  ;JFT array size, 20 => PSP JFT in use
+   425 00000050 ??????              <1>     .unixEntry  db 3 dup (?)  ;Must always be CDh 21h CBh, same place as DOS
+   426 00000053 ????????????????    <1>     .prevPSP    dq ?  ;Pointer to the previous PSP in chain (used by SHARE)
+   427 0000005B ??                  <1>                 db ?  ;Reserved byte
+   428                              <1> ;The below are in the same place as in DOS.
+   429                              <1>     .cmdLineArgPtr: ;Symbol for future use
+   430 0000005C <res 10h>           <1>     .fcb1       db 16 dup (?)  ;First FCB,    argument 1 
+   431 0000006C <res 14h>           <1>     .fcb2       db 20 dup (?)  ;Second FCB,   argument 2
+   432                              <1>     .dta:   ;Pointer to the default DTA in the PSP
+   433 00000080 ??                  <1>     .parmList   db ?   ;Number of characters in command tail
+   434 00000081 <res 7Fh>           <1>     .progTail   db 127 dup (?) ;Default DTA/Program tail
+   435                              <1> endstruc
+   436                              <1> 
+   437                              <1> struc clkStruc
+   438 00000000 ????                <1>     .dateWord   dw ?
+   439 00000002 ??                  <1>     .minutes    db ?
+   440 00000003 ??                  <1>     .hours      db ?
+   441 00000004 ??                  <1>     .hseconds   db ?  ;Hundreths of seconds
+   442 00000005 ??                  <1>     .seconds    db ?
+   443                              <1> endstruc
+   444                              <1> 
+   445                              <1> 
+   446                              <1> struc extCtryStruc
+   447 00000000 ??                  <1>     .infoIDCode db ?    ;Information ID code (01h)
+   448 00000001 ????                <1>     .strucSize  dw ?    ;Length of the structure  (42 or less)
+   449 00000003 ????                <1>     .ctryID     dw ?    ;Country ID number
+   450 00000005 ????                <1>     .cpNumber   dw ?    ;Code page number
+   451 00000007 ????                <1>     .dtfmt      dw ?    ;Date time format (2 bytes)
+   452                              <1>                         ;0 = month day year hh:mm:ss
+   453                              <1>                         ;1 = day month year hh:mm:ss
+   454                              <1>                         ;2 = year month day hh:mm:ss
+   455 00000009 ??????????          <1>     .curr       db 5 dup (?)   ;ASCIIZ Currency symbol (5 chars)
+   456 0000000E ????                <1>     .thouSep    db 2 dup (?)   ;ASCIIZ Thousands separator
+   457 00000010 ????                <1>     .dcmlSep    db 2 dup (?)   ;ASCIIZ Decimal separator
+   458 00000012 ????                <1>     .dateSep    db 2 dup (?)   ;ASCIIZ Date separator
+   459 00000014 ????                <1>     .timeSep    db 2 dup (?)   ;ASCIIZ Time separator
+   460 00000016 ??                  <1>     .currFmt    db ?    ;Currency Format
+   461                              <1>                         ;0 = Symbol leads, without space
+   462                              <1>                         ;1 = Symbol follows, without space
+   463                              <1>                         ;2 = Symbol leads, one space
+   464                              <1>                         ;3 = Symbol follows, one space
+   465                              <1>                         ;4 = Symbol replace decimal separator
+   466 00000017 ??                  <1>     .digtdpt    db ?    ;Number of digits after the decimal point
+   467 00000018 ??                  <1>     .timefmt    db ?    ;Time format, Bit 0 = 0 => 12 hour, = 1 => 24 hour clock
+   468 00000019 ????????????????    <1>     .mapptr     db 8 dup (?)  ;Case map address (0 is nulptr), needs fixing up
+   469 00000021 ????                <1>     .dataSep    db 2 dup (?)  ;Data list separator
+   470 00000023 <res Ah>            <1>     .resv       db 10 dup (?) ;Reserve 10 bytes
+   471                              <1> endstruc
+   472                              <1> 
+   473                              <1> struc countryStruc
+   474 00000000 ????                <1>     .dtfmt      dw ?    ;Date time format (2 bytes)
+   475                              <1>                         ;0 = month day year hh:mm:ss
+   476                              <1>                         ;1 = day month year hh:mm:ss
+   477                              <1>                         ;2 = year month day hh:mm:ss
+   478 00000002 ??????????          <1>     .curr       db 5 dup (?)   ;ASCIIZ Currency symbol (5 chars)
+   479 00000007 ????                <1>     .thouSep    db 2 dup (?)   ;ASCIIZ Thousands separator
+   480 00000009 ????                <1>     .dcmlSep    db 2 dup (?)   ;ASCIIZ Decimal separator
+   481 0000000B ????                <1>     .dateSep    db 2 dup (?)   ;ASCIIZ Date separator
+   482 0000000D ????                <1>     .timeSep    db 2 dup (?)   ;ASCIIZ Time separator
+   483 0000000F ??                  <1>     .currFmt    db ?    ;Currency Format
+   484                              <1>                         ;0 = Symbol leads, without space
+   485                              <1>                         ;1 = Symbol follows, without space
+   486                              <1>                         ;2 = Symbol leads, one space
+   487                              <1>                         ;3 = Symbol follows, one space
+   488                              <1>                         ;4 = Symbol replace decimal separator
+   489 00000010 ??                  <1>     .digtdpt    db ?    ;Number of digits after the decimal point
+   490 00000011 ??                  <1>     .timefmt    db ?    ;Time format, Bit 0 = 0 => 12 hour, = 1 => 24 hour clock
+   491 00000012 ????????????????    <1>     .mapptr     db 8 dup (?)  ;Case map address (0 is nulptr), needs fixing up
+   492 0000001A ????                <1>     .dataSep    db 2 dup (?)  ;Data list separator
+   493 0000001C <res Ah>            <1>     .resv       db 10 dup (?) ;Reserve 10 bytes
+   494                              <1> endstruc
+   495                              <1> 
+   496                              <1> ;Critical Error AH bitfield equates
+   497                              <1> critRead    equ 0h
+   498                              <1> critWrite   equ 1h
+   499                              <1> critDOS     equ 0h
+   500                              <1> critFAT     equ 2h
+   501                              <1> critDir     equ 4h
+   502                              <1> critData    equ 6h
+   503                              <1> critFailOK  equ 8h
+   504                              <1> critRetryOK equ 10h
+   505                              <1> critIgnorOK equ 20h
+   506                              <1> critCharDev equ 80h
+   507                              <1> 
+   508                              <1> critIgnore  equ 0
+   509                              <1> critRetry   equ 1
+   510                              <1> critAbort   equ 2
+   511                              <1> critFail    equ 3
+   512                              <1> 
+   513                              <1> ;MISC ASCII control chars
+   514                              <1> NUL equ 00h ;^@         | ASCII Null
+   515                              <1> ETX equ 03h ;^C         | ASCII Break (End of Text) 
+   516                              <1> ACK equ 06h ;^F         | ASCII Acknowledgement
+   517                              <1> BEL equ 07h ;^G         | ASCII Bell
+   518                              <1> BSP equ 08h ;^H         | ASCII Backspace
+   519                              <1> TAB equ 09h ;^I         | ASCII Horizontal Tab
+   520                              <1> LF  equ 0Ah ;^J         | ASCII Line Feed
+   521                              <1> CR  equ 0Dh ;^M         | ASCII Carriage Return
+   522                              <1> DLE equ 10h ;^P         | ASCII Data Link End (Toggle Print Echo)
+   523                              <1> DC3 equ 13h ;^S         | ASCII Device Control 3 (Toggle Scroll Lock)
+   524                              <1> DC4 equ 14h ;^T         | ASCII Device Control 4
+   525                              <1> NAK equ 15h ;^U         | ASCII Negative Acknowledgement
+   526                              <1> ETB equ 17h ;^W         | ASCII End of Transmission Block
+   527                              <1> EOF equ 1Ah ;^Z         | ASCII Substitute character (End of File)
+   528                              <1> ESC equ 1Bh ;           | ASCII Escape char, used for ANSI.SYS
+   529                              <1> SPC equ 20h ;Printable  | ASCII Space
+   530                              <1> ;This last one is NEVER printed with a caret as it is a console control char
+   531                              <1> DEL equ 7Fh ;^?         | ASCII Rubout (Del char and dec cursor)
+   532                              <1> 
+   533                              <1> asciiCaret  equ 20h ;Used to check which chars need to be printed with caret
+   534                              <1> ;Extended Ascii Codes
+   535                              <1> eF1     equ 3Bh ;F1 second byte
+   536                              <1> eF2     equ 3Ch ;F2 second byte
+   537                              <1> eF3     equ 3Dh ;F3 second byte
+   538                              <1> eF4     equ 3Eh ;F4 second byte
+   539                              <1> eF5     equ 3Fh ;F5 second byte
+   540                              <1> eF6     equ 40h ;F6 second byte
+   541                              <1> eF7     equ 41h ;F7 second byte
+   542                              <1> eCursL  equ 4Bh ;Cursor Left second byte
+   543                              <1> eCursR  equ 4Dh ;Cursor Right second byte
+   544                              <1> eIns    equ 52h ;Insert second byte
+   545                              <1> eDel    equ 53h ;DEL second byte (not necessarily delete key)
+   546                              <1> 
+   547                              <1> ;Default Configuration for the system
+   548                              <1> 
+   549                              <1> buffersDefault  equ 30
+   550                              <1> filesDefault    equ 20
+   551                              <1> fcbsDefault     equ 4
+   552                              <1> safeFcbsDeflt   equ 0
+   553                              <1> lastDriveDeflt  equ 5   
+   554                              <1> 
+   555                              <1> ;ASCII char property table equates. If such a bit is clear in signature in table
+   556                              <1> ; then the char has this property.
+   557                              <1> badChar     equ 1   ;Bad ASCIIZ filename char
+   558                              <1> termChar    equ 2   ;Terminator char type
+   559                              <1> sepChar     equ 4   ;Separator char type
+   560                              <1> badFCBChar  equ 8   ;FCB filename char
+   561                              <1> 
+   562                              <1> ;Nice STDIO equates
+   563                              <1> STDIN   equ 0
+   564                              <1> STDOUT  equ 1
+   565                              <1> STDERR  equ 2
+   566                              <1> STDAUX  equ 3
+   567                              <1> STDPRN  equ 4
+    32                                  %include "./inc/fatStruc.inc"
+     1                              <1> 
+     2                              <1> ;-------------------------------------------------------;
+     3                              <1> ; This include file contains miscellaneous FAT driver   ;
+     4                              <1> ; structures. exFAT will have it's own files at a later ;
+     5                              <1> ; stage.                                                ;
+     6                              <1> ;-------------------------------------------------------;
+     7                              <1> ;-------------------------------------------------------;
+     8                              <1> ;-------------------------------------------------------;
+     9                              <1> ;  IMPORTANT!!! IMPORTANT!!! IMPORTANT!!! IMPORTANT!!!  ;
+    10                              <1> ;   REMEMBER, CLUSTER NUMBERS START AT 2!               ;
+    11                              <1> ;   THE FIRST DATA CLUSTER ON A DISK IS CLUSTER 2!!!    ;
+    12                              <1> ;   ON FAT12/16, A CLUSTER NUMBER OF 0 MEANS ROOT DIR!  ;
+    13                              <1> ;   ON FAT32, A CLUSTER NUMBER OF 0 ALIASES THE FIRST   ;
+    14                              <1> ;       CLUSTER OF THE ROOT DIRECTORY!!                 ;
+    15                              <1> ;  IMPORTANT!!! IMPORTANT!!! IMPORTANT!!! IMPORTANT!!!  ;
+    16                              <1> ;-------------------------------------------------------;
+    17                              <1> 
+    18                              <1> struc oemHeader
+    19 00000000 ??????              <1>     .jump       db 3 dup (?)    ;Jump instruction
+    20 00000003 ????????????????    <1>     .oemString  db 8 dup (?)    ;OEM string
+    21                              <1> endstruc
+    22                              <1> 
+    23                              <1> struc bpb          ;FAT 12 and 16 BPB
+    24 00000000 ????                <1>     .bytsPerSec dw ?  ;Bytes per sector
+    25 00000002 ??                  <1>     .secPerClus db ?  ;Sectors per cluster
+    26 00000003 ????                <1>     .revdSecCnt dw ?  ;Number of reserved sectors, in volume
+    27 00000005 ??                  <1>     .numFATs    db ?  ;Number of FATs on media
+    28 00000006 ????                <1>     .rootEntCnt dw ?  ;Number of 32 byte entries in Root directory
+    29 00000008 ????                <1>     .totSec16   dw ?  ;Number of sectors on medium
+    30 0000000A ??                  <1>     .media      db ?  ;Media descriptor byte
+    31 0000000B ????                <1>     .FATsz16    dw ?  ;Number of sectors per FAT
+    32 0000000D ????                <1>     .secPerTrk  dw ?  ;Number of sectors per "track"
+    33 0000000F ????                <1>     .numHeads   dw ?  ;Number of read "heads"
+    34 00000011 ????????            <1>     .hiddSec    dd ?  ;Number of hidden sectors, preceeding volume start
+    35 00000015 ????????            <1>     .totSec32   dd ?  ;32 bit count of sectors
+    36                              <1> endstruc
+    37                              <1> 
+    38                              <1> struc extBs
+    39                              <1> ;Extended bootsector structure. If present, comes immediately after 
+    40                              <1> ; BPB in bootsector
+    41 00000000 ??                  <1>     .drvNum     db ?  ;Logical drive number (00h or 80h)
+    42 00000001 ??                  <1>     .reserved1  db ?  ;Reserved byte
+    43 00000002 ??                  <1>     .bootSig    db ?  ;Extended boot signature
+    44 00000003 ????????            <1>     .volId      dd ?  ;Volume serial number
+    45 00000007 <res Bh>            <1>     .volLab     db 11 dup (?) ;Volume label string
+    46 00000012 ????????????????    <1>     .filSysType db 8 dup (?)  ;File system type string
+    47                              <1> endstruc
+    48                              <1> extBsSig    equ 29h
+    49                              <1> 
+    50                              <1> struc bpb32       ;FAT 32 BPB
+    51 00000000 ????                <1>     .bytsPerSec dw ?  ;Bytes per sector
+    52 00000002 ??                  <1>     .secPerClus db ?  ;Sectors per cluster
+    53 00000003 ????                <1>     .revdSecCnt dw ?  ;Number of reserved sectors
+    54 00000005 ??                  <1>     .numFATs    db ?  ;Number of FATs on media
+    55 00000006 ????                <1>     .rootEntCnt dw ?  ;Number of entries in Root directory
+    56 00000008 ????                <1>     .totSec16   dw ?  ;Number of sectors on medium
+    57 0000000A ??                  <1>     .media      db ?  ;Media descriptor byte
+    58 0000000B ????                <1>     .FATsz16    dw ?  ;Number of sectors per FAT, must be 0 for FAT 32
+    59 0000000D ????                <1>     .secPerTrk  dw ?  ;Number of sectors per "track"
+    60 0000000F ????                <1>     .numHeads   dw ?  ;Number of read "heads"
+    61 00000011 ????????            <1>     .hiddSec    dd ?  ;Number of hidden sectors
+    62 00000015 ????????            <1>     .totSec32   dd ?  ;32 bit count of sectors
+    63 00000019 ????????            <1>     .FATsz32    dd ?  ;32 bit count of sectors occupied by one FAT
+    64 0000001D ????                <1>     .extFlags   dw ?  ;Extended Flags word
+    65 0000001F ????                <1>     .FSver      dw ?  ;File system version word, must be 0
+    66 00000021 ????????            <1>     .RootClus   dd ?  ;First Cluster of Root Directory
+    67 00000025 ????                <1>     .FSinfo     dw ?  ;Sector number of FSINFO structure, usually 1
+    68 00000027 ????                <1>     .BkBootSec  dw ?  ;Backup Boot sector, either 0 or 6
+    69 00000029 <res Ch>            <1>     .reserved   db 12 dup (?) ;Reserved 12 bytes
+    70                              <1> endstruc
+    71                              <1> 
+    72                              <1> struc FSInfo
+    73 00000000 ????????            <1>     .leadSig    dd ? ;Leading Signature, should be 041615252h
+    74 00000004 <res 1E0h>          <1>     .reserved1  db 480 dup (?)
+    75 000001E4 ????????            <1>     .strucSig   dd ?  ;Should be 061417272h
+    76 000001E8 ????????            <1>     .freeCount  dd ?  ;Contains the last known free cluster on volume
+    77 000001EC ????????            <1>     .nextFree   dd ?  ;Contains the first known free cluster on volume
+    78 000001F0 <res Ch>            <1>     .reserved2  db 12 dup (?) ;Should be 0
+    79 000001FC ????????            <1>     .trailSig   dd ?  ;Should be 0AA550000h
+    80                              <1> endstruc
+    81                              <1> 
+    82                              <1> fsInfoSig1  equ 041615252h
+    83                              <1> fsInfoSig2  equ 061417272h
+    84                              <1> fsInfoSig3  equ 0AA550000h
+    85                              <1> 
+    86                              <1> struc mbr
+    87 00000000 <res 1B8h>          <1>     .bsCode     db 440 dup (?)
+    88 000001B8 ????????            <1>     .diskID     dd ?
+    89 000001BC ????                <1>     .reserved   dw ?
+    90 000001BE <res 10h>           <1>     .mbrEntry1  db 16 dup (?)
+    91 000001CE <res 10h>           <1>     .mbrEntry2  db 16 dup (?)
+    92 000001DE <res 10h>           <1>     .mbrEntry3  db 16 dup (?)
+    93 000001EE <res 10h>           <1>     .mbrEntry4  db 16 dup (?)
+    94 000001FE ????                <1>     .mbrSig     dw ?
+    95                              <1> endstruc
+    96                              <1> 
+    97                              <1> struc ebr   ;A special type of MBR
+    98 00000000 <res 1BEh>          <1>     .bsCode     db 446 dup (?)    ;Basic 16-bit code to error if launched into
+    99 000001BE <res 10h>           <1>     .ebrVolHdr  db 16 dup (?) ;Information about the volume itself
+   100 000001CE <res 10h>           <1>     .ebrLinkHdr db 16 dup (?) ;Link ptr to next logical volume in ebr
+   101 000001DE <res 20h>           <1>     .reserved   db 32 dup (?) ;Reserved
+   102 000001FE ????                <1>     .mbrSig     dw ?
+   103                              <1> endstruc
+   104                              <1> 
+   105                              <1> struc mbrEntry
+   106 00000000 ??                  <1>     .ptnAtrib   db ?  ;80h = active
+   107 00000001 ??????              <1>     .chsStart   db 3 dup (?)  ;Ignore practically
+   108 00000004 ??                  <1>     .ptnType    db ?  ;This being 00 means free
+   109 00000005 ??????              <1>     .chsEnd     db 3 dup (?)  ;Ignore
+   110 00000008 ????????            <1>     .lbaStart   dd ?  ;Start of partition in 32 bit LBA
+   111 0000000C ????????            <1>     .numSectors dd ?  ;Number of sectors in partition
+   112                              <1> endstruc
+   113                              <1> 
+   114                              <1> struc fatDirEntry
+   115 00000000 <res Bh>            <1>     .name       db 11 dup (?) ;8.3 File Name w/o fullstop
+   116 0000000B ??                  <1>     .attribute  db ?  ;Usual attributes
+   117 0000000C ??                  <1>     .ntRes      db ?  ;Reserved 0
+   118 0000000D ??                  <1>     .crtTimeT   db ?  ;Count of tenths of a second of file creation time <=199
+   119 0000000E ????                <1>     .crtTime    dw ?  ;Creation time, granularity of 2 seconds
+   120 00000010 ????                <1>     .crtDate    dw ?  ;Creation date
+   121 00000012 ????                <1>     .lastAccDat dw ?  ;Last Read/Write date, not 100% supported (consider later)
+   122 00000014 ????                <1>     .fstClusHi  dw ?  ;Hi word of 1st data cluster for file/dir, 0 on FAT12/16
+   123 00000016 ????                <1>     .wrtTime    dw ?  ;Last modification (write) time
+   124 00000018 ????                <1>     .wrtDate    dw ?  ;Last modification (write) date
+   125 0000001A ????                <1>     .fstClusLo  dw ?  ;Lo word of 1st data cluster for file/dir
+   126 0000001C ????????            <1>     .fileSize   dd ?  ;32-bit quantity with size of file described by entry
+   127                              <1> endstruc
+   128                              <1> ;Directory attribute equates
+   129                              <1>     dirReadOnly     equ 01h
+   130                              <1>     dirHidden       equ 02h
+   131                              <1>     dirSystem       equ 04h
+   132                              <1>     dirVolumeID     equ 08h
+   133                              <1>     dirDirectory    equ 10h
+   134                              <1>     dirArchive      equ 20h
+   135                              <1>     dirCharDev      equ 40h ;Never written to disk, used to represent a Char Dev
+   136                              <1>     dirLongName     equ dirReadOnly | dirHidden | dirSystem | dirVolumeID
+   137                              <1>     ;If any of the three bits are set, then ALL three bits are set
+   138                              <1>     ; in addition to whatever the user passed to search for.
+   139                              <1>     dirInclusive    equ dirHidden | dirSystem | dirDirectory
+   140                              <1>     dirIncFiles     equ dirHidden | dirSystem
+   141                              <1> 
+   142                              <1> struc bpbEx   ;exFAT BPB, SIZE: 120 bytes
+   143                              <1> 
+   144                              <1>     ;.jmpBoot                db 3 dup (?)
+   145                              <1>     ;.oemName                db 8 dup (?)  ;OEM name
+   146                              <1> ;BPB starts here
+   147 00000000 <res 35h>           <1>     .MustBeZero             db 53 dup (?) ;Must be 0, 53 bytes
+   148 00000035 ????????????????    <1>     .partitionOffset        dq ?  ;in sectors, 0 means ignore this field
+   149 0000003D ????????????????    <1>     .volumeLength           dq ?  ;Volume Length in sectors
+   150 00000045 ????????            <1>     .FAToffset              dd ?  ;Volume rel offset of first FAT, in sectors
+   151 00000049 ????????            <1>     .FATlength              dd ?  ;FAT length, in sectors
+   152 0000004D ????????            <1>     .clusterHeapOffset      dd ?  ;Start of data area, in sectors
+   153 00000051 ????????            <1>     .clusterCount           dd ?  ;Number of clusters on medium
+   154 00000055 ????????            <1>     .firstClusterOfRootDir  dd ?  ;First Cluster of Root Directory, min 2
+   155 00000059 ????????            <1>     .volumeSerialNum        dd ?  ;Volume Serial Number
+   156 0000005D ????                <1>     .FSrevision             dw ?  ;Should be 0001 (v1.00)
+   157 0000005F ????                <1>     .volumeFlags            dw ?  ;Volume Flags, refer to documentation
+   158 00000061 ??                  <1>     .bytesPerSectorShift    db ?  ;min 9 (512 bps), max 12 (4096 bps)
+   159 00000062 ??                  <1>     .sectorsPerClusterShift db ?  ;Result of log_2(N) for N=sec per clus
+   160 00000063 ??                  <1>     .numberOfFATs           db ?  ;Number of FATs, only 1 or 2
+   161 00000064 ??                  <1>     .driveSelect            db ?  ;Drive Select, 0 or 80h (Int 13h)
+   162 00000065 ??                  <1>     .percentInUse           db ?  ;Rounded down. FFh means unknown
+   163 00000066 ??????????????      <1>     .reserved               db 7 dup (?)  ;Reserved for alignment
+   164                              <1> 
+   165                              <1> endstruc
+    33                                  %include "./inc/dosError.inc"
+     1                              <1> ;DOS Error codes
+     2                              <1> 
+     3                              <1> ;Extended Error Codes
+     4                              <1> errInvFnc   equ 1   ;Invalid function number
+     5                              <1> errFnf      equ 2   ;File not found
+     6                              <1> errPnf      equ 3   ;Path not found
+     7                              <1> errNhl      equ 4   ;Too many open handles, no handles left
+     8                              <1> errAccDen   equ 5   ;Access denied (to resource)
+     9                              <1> errBadHdl   equ 6   ;Invalid handle
+    10                              <1> errMCBbad   equ 7   ;MCB's destroyed
+    11                              <1> errNoMem    equ 8   ;Insufficient memory
+    12                              <1> errMemAddr  equ 9   ;Invalid Memory Block Address
+    13                              <1> errBadEnv   equ 10  ;Invalid environment
+    14                              <1> errBadFmt   equ 11  ;Invalid format (path etc)
+    15                              <1> errAccCde   equ 12  ;Invalid Access Code    ?
+    16                              <1> errInvDat   equ 13  ;Invalid data
+    17                              <1> ;           equ 14  ;Reserved
+    18                              <1> errBadDrv   equ 15  ;Invalid drive specified
+    19                              <1> errDelCD    equ 16  ;Attempt to delete the current directory
+    20                              <1> errDevUnk   equ 17  ;Not the same device (Device Unknown)
+    21                              <1> errNoFil    equ 18  ;No more files, no match found
+    22                              <1> ;The following are Driver error codes + 19
+    23                              <1> drvErrShft  equ 19  ;Used to shift Driver error codes to extended error codes
+    24                              <1> errWpd      equ 19  ;Attempt to write on write protected disk
+    25                              <1> errUnkUnt   equ 20  ;Unknown Unit
+    26                              <1> errDrvNR    equ 21  ;Drive not ready
+    27                              <1> errUnkCmd   equ 22  ;Unknown Command
+    28                              <1> errCRCerr   equ 23  ;Data (CRC) error
+    29                              <1> errBadRLn   equ 24  ;Bad request structure length
+    30                              <1> errSekErr   equ 25  ;Seek error
+    31                              <1> errUnkMed   equ 26  ;Unknown media type
+    32                              <1> errSecNF    equ 27  ;Sector not Found
+    33                              <1> errNoPap    equ 28  ;Printer out of paper
+    34                              <1> errWF       equ 29  ;Write fault
+    35                              <1> errRF       equ 30  ;Read fault
+    36                              <1> errGF       equ 31  ;General fault
+    37                              <1> ;----------------------------------------------
+    38                              <1> ;The following two go inbetween the Disk errors
+    39                              <1> errShrVio   equ 32  ;Sharing violations
+    40                              <1> errLokVio   equ 33  ;File Lock violation
+    41                              <1> ;----------------------------------------------
+    42                              <1> errIDC      equ 34  ;Driver code, Invalid Disk Change
+    43                              <1> errNoFCB    equ 35  ;FCB unavailable
+    44                              <1> errShrFul   equ 36  ;Sharing buffer full
+    45                              <1> 
+    46                              <1> errNoNet    equ 50  ;Network request not supported, generic net fail
+    47                              <1> 
+    48                              <1> errFilExist equ 80  ;File already exists
+    49                              <1> errDirExist equ 82  ;Directory already exists
+    50                              <1> errFI44     equ 83  ;Fail on Int 24h
+    51                              <1> errRedir    equ 84  ;Too many levels of redirection
+    52                              <1> errDupRedir equ 85  ;Trying to redirect a redirection
+    53                              <1> errBadPass  equ 86  ;Bad password
+    54                              <1> errBadParam equ 87  ;Bad parameter passed to request
+    55                              <1> errNetWrite equ 88  ;Network Write Fault
+    56                              <1> ;-----------------------------------------------------------------------------
+    57                              <1> ;Error Loci
+    58                              <1> eLocUnk     equ 1   ;Unknown locus, nonspecific or not appropriate
+    59                              <1> eLocDsk     equ 2   ;Disk, related to Random Access to a disk or block device
+    60                              <1> eLocNet     equ 3   ;Network related issues, shouldnt affect us (yet!)
+    61                              <1> eLocChr     equ 4   ;Serial/Character Device error
+    62                              <1> eLocMem     equ 5   ;Related to RAM
+    63                              <1> ;-----------------------------------------------------------------------------
+    64                              <1> ;Error Actions
+    65                              <1> eActRet     equ 1   ;Retry
+    66                              <1> eActDRet    equ 2   ;Delay then retry (Try again later)
+    67                              <1> eActUsr     equ 3   ;Ask user to re-input data, i.e. bad filename or something
+    68                              <1> eActAbt     equ 4   ;Abort with cleanup
+    69                              <1> eActKil     equ 5   ;Abort without cleanup
+    70                              <1> eActIgn     equ 6   ;Ignore error
+    71                              <1> eActRetUsr  equ 7   ;Retry after user intervention (i.e swap remdev)
+    72                              <1> ;-----------------------------------------------------------------------------
+    73                              <1> ;Error classes
+    74                              <1> eClsOoR     equ 1   ;Out of resources, no mem or handles
+    75                              <1> eClsTS      equ 2   ;Temp sitch, should go away
+    76                              <1> eClsAuth    equ 3   ;Authorisation, e.g. file permission error 
+    77                              <1> eClsInt     equ 4   ;Internal DOS error or bug
+    78                              <1> eClsHrdFlt  equ 5   ;Hardware Failure
+    79                              <1> eClsSysFlt  equ 6   ;System Failure, i.e. missing or bad cfg files
+    80                              <1> eClsAppFlt  equ 7   ;Application Program error, inconsistent requests etc...
+    81                              <1> eClsNotFnd  equ 8   ;Resource not found (such as free SFT entry etc...)
+    82                              <1> eClsBadFmt  equ 9   ;Bad format for resource
+    83                              <1> eClsLocked  equ 10  ;Resource Locked
+    84                              <1> eClsMedia   equ 11  ;Error is on medium, i.e. wrong or damaged remdev
+    85                              <1> eClsClash   equ 12  ;Resource already exists!
+    86                              <1> eClsUnk     equ 13  ;Unknown class
+    34                                  
+    35                                  struc sysInitTableStruc
+    36 00000000 ??                          .length     resb 1
+    37 00000001 ??                          .numSec     resb 1
+    38 00000002 ????                        .resWord    resb 2
+    39 00000004 ????????????????            .firstLba   resb 8
+    40                                  ;---------The below is added for convenience----------
+    41 0000000C ??                          .bootable   resb 1  ;Flag to indicate bootable
+    42                                  endstruc
+    43                                  
+    44                                  %include "./src/sysMain.asm"
+     1                              <1> startSys:
+     2 00000000 EB03                <1>     jmp short .cVersion
+     3 00000002 01                  <1> .vNum:          db 1
+     4 00000003 0002                <1> .sectorSize:    dw 200h
+     5                              <1> .cVersion:
+     6 00000005 50                  <1>     push rax
+     7 00000006 B430                <1>     mov ah, 30h
+     8 00000008 CD21                <1>     int 21h
+     9 0000000A 3A05F2FFFFFF        <1>     cmp al, byte [.vNum] ;Version 1
+    10 00000010 760D                <1>     jbe .okVersion
+    11 00000012 58                  <1>     pop rax
+    12 00000013 488D1501060000      <1>     lea rdx, badVerStr
+    13 0000001A E951030000          <1>     jmp badPrint ;Exit to caller or DOS to print bad command interpreter line
+    14                              <1> .okVersion:
+    15                              <1> ;Check the passed argument is ok (flag in al)
+    16 0000001F 58                  <1>     pop rax
+    17 00000020 3CFF                <1>     cmp al, -1
+    18 00000022 750C                <1>     jnz .driveOk
+    19                              <1> .badDrive:
+    20 00000024 488D1506060000      <1>     lea rdx, badDrvLtr
+    21 0000002B E940030000          <1>     jmp badPrint
+    22                              <1> .driveOk:
+    23                              <1> ;Now fetch the drive we are working on
+    24 00000030 418A505C            <1>     mov dl, byte [r8 + psp.fcb1] ;Get the fcb 1 based drvNum
+    25 00000034 FECA                <1>     dec dl  ;Turn it into a 0 based number
+    26 00000036 88153D050000        <1>     mov byte [sysDrive], dl
+    27 0000003C 80C241              <1>     add dl, "A"
+    28 0000003F 8815CF050000        <1>     mov byte [rootDir], dl
+    29 00000045 88156E050000        <1>     mov byte [biosDest], dl
+    30 0000004B 881585050000        <1>     mov byte [dosDest], dl
+    31 00000051 88159C050000        <1>     mov byte [cmdDest], dl
+    32                              <1>     ;Now get current drive
+    33 00000057 B800190000          <1>     mov eax, 1900h  ;Get current drive as the source of the copy
+    34 0000005C CD21                <1>     int 21h
+    35 0000005E 0441                <1>     add al, "A" ;Convert to an ASCII char
+    36 00000060 880544050000        <1>     mov byte [biosFile], al
+    37 00000066 88055C050000        <1>     mov byte [dosFile], al
+    38 0000006C 880572050000        <1>     mov byte [cmdFile], al
+    39                              <1> ;Now we check that the drive specified is a physical device
+    40 00000072 B452                <1>     mov ah, 52h
+    41 00000074 CD21                <1>     int 21h ;Get in rbx a ptr to list of lists
+    42 00000076 4881C32A000000      <1>     add rbx, 2Ah    ;Point rbx to cdsHeadPtr
+    43 0000007D 488B33              <1>     mov rsi, qword [rbx]    ;Get the ptr to the CDS array
+    44 00000080 0FB60DF2040000      <1>     movzx ecx, byte [sysDrive]
+    45 00000087 67E30B              <1>     jecxz .atCurrentCDS
+    46                              <1> .walkCDSArray:
+    47 0000008A 4881C65F000000      <1>     add rsi, cds_size
+    48 00000091 FFC9                <1>     dec ecx
+    49 00000093 75F5                <1>     jnz .walkCDSArray
+    50                              <1> .atCurrentCDS: 
+    51 00000095 66F7464300B0        <1>     test word [rsi + cds.wFlags], cdsJoinDrive | cdsSubstDrive | cdsRedirDrive
+    52 0000009B 7587                <1>     jnz .badDrive
+    53 0000009D 488B7645            <1>     mov rsi, qword [rsi + cds.qDPBPtr]  ;Get the DPB ptr 
+    54 000000A1 488935E2040000      <1>     mov qword [dpbPtr], rsi ;Save the DPB ptr
+    55                              <1> ;Now step 1, search root dir, if a file is found
+    56 000000A8 488D1565050000      <1>     lea rdx, rootDir
+    57 000000AF B916000000          <1>     mov ecx, dirInclusive
+    58 000000B4 B8004E0000          <1>     mov eax, 4E00h
+    59 000000B9 CD21                <1>     int 21h
+    60 000000BB 7312                <1>     jnc .fileFound
+    61 000000BD 2402                <1>     and al, 2   ;Clear the upper bit (turning errNoFil into errFnf)
+    62 000000BF 3C02                <1>     cmp al, errFnf
+    63 000000C1 7426                <1>     je .rootDirOk
+    64                              <1> .badRoot:
+    65 000000C3 488D1581050000      <1>     lea rdx, badRootDir
+    66 000000CA E9A1020000          <1>     jmp badPrint
+    67                              <1> .fileFound:
+    68                              <1> ;A File was found, if it is a Volume Label, do a find next
+    69 000000CF 498DB880000000      <1>     lea rdi, qword [r8 + psp.dta]   ;Get ptr to the find first block
+    70 000000D6 807F0C08            <1>     cmp byte [rdi + ffBlock.attrib], dirVolumeID
+    71 000000DA 75E7                <1>     jne .badRoot
+    72 000000DC B8004F0000          <1>     mov eax, 4F00h  ;Find Next
+    73 000000E1 CD21                <1>     int 21h
+    74 000000E3 73DE                <1>     jnc .badRoot    ;Another file found, exit bad
+    75 000000E5 3C12                <1>     cmp al, errNoFil
+    76 000000E7 75DA                <1>     jne .badRoot
+    77                              <1> .rootDirOk:
+    78 000000E9 F8                  <1>     clc ;Clear CF
+    79 000000EA B8001C0000          <1>     mov eax, 1C00h  ;Get FAT information
+    80 000000EF 8A1584040000        <1>     mov dl, byte [sysDrive]
+    81 000000F5 FEC2                <1>     inc dl  ;Convert to 1 based number
+    82 000000F7 CD21                <1>     int 21h
+    83 000000F9 66890D83040000      <1>     mov word [sectorSize], cx   ;Move the sector size in, use for buffer size
+    84 00000100 88057F040000        <1>     mov byte [secPerClus], al   ;Save the number of sectors per cluster too
+    85 00000106 89157A040000        <1>     mov dword [clustCnt], edx   ;Save the count of clusters
+    86 0000010C 488D15F9050000      <1>     lea rdx, badSecSize
+    87 00000113 663B0DE9FEFFFF      <1>     cmp cx, word [startSys.sectorSize]    ;Temporary restriction for DOS 1.0.
+    88 0000011A 0F8550020000        <1>     jne badPrint
+    89                              <1> ;Now open two handles to the two files
+    90 00000120 E832040000          <1>     call dosCrit1Enter
+    91                              <1> 
+    92 00000125 488D357E040000      <1>     lea rsi, biosNamePair
+    93 0000012C 488D3D6B040000      <1>     lea rdi, biosPair
+    94 00000133 B90F000000          <1>     mov ecx, biosNameL
+    95 00000138 B307                <1>     mov bl, dirReadOnly | dirHidden | dirSystem    ;Attribute
+    96 0000013A E8D3020000          <1>     call openFiles
+    97 0000013F 0F8217020000        <1>     jc badHandle
+    98                              <1> 
+    99 00000145 488D357C040000      <1>     lea rsi, dosNamePair
+   100 0000014C 488D3D4F040000      <1>     lea rdi, dosPair
+   101 00000153 B90E000000          <1>     mov ecx, dosNameL
+   102 00000158 B307                <1>     mov bl, dirReadOnly | dirHidden | dirSystem    ;Attribute
+   103 0000015A E8B3020000          <1>     call openFiles
+   104 0000015F 0F82F7010000        <1>     jc badHandle
+   105                              <1> 
+   106 00000165 488D3532040000      <1>     lea rsi, biosPair
+   107 0000016C E8C9020000          <1>     call copyFile
+   108 00000171 0F82CB010000        <1>     jc badXfer
+   109                              <1> 
+   110 00000177 488D3524040000      <1>     lea rsi, dosPair
+   111 0000017E E8B7020000          <1>     call copyFile
+   112 00000183 0F82B9010000        <1>     jc badXfer
+   113                              <1> 
+   114                              <1> ;We close system handles here to update the DIR entries
+   115 00000189 B8003E0000          <1>     mov eax, 3E00h
+   116 0000018E 668B1D0B040000      <1>     mov bx, word [biosHdlDst]
+   117 00000195 CD21                <1>     int 21h
+   118 00000197 B8003E0000          <1>     mov eax, 3E00h
+   119 0000019C 668B1D01040000      <1>     mov bx, word [dosHdlDst]
+   120 000001A3 CD21                <1>     int 21h
+   121                              <1> 
+   122                              <1> ;Now also copy the default DOS command interpreter
+   123 000001A5 488D3538040000      <1>     lea rsi, cmdNamePair
+   124 000001AC 488D3DF3030000      <1>     lea rdi, cmdPair
+   125 000001B3 B90F000000          <1>     mov ecx, cmdNameL
+   126 000001B8 31DB                <1>     xor ebx, ebx    ;Attribute, no attribute
+   127 000001BA E853020000          <1>     call openFiles
+   128 000001BF 0F8297010000        <1>     jc badHandle
+   129                              <1> 
+   130 000001C5 488D35DA030000      <1>     lea rsi, cmdPair
+   131 000001CC E869020000          <1>     call copyFile
+   132 000001D1 0F826B010000        <1>     jc badXfer
+   133                              <1> 
+   134                              <1> ;Now we must do the fun part, setting the Boot Sector details
+   135                              <1> ;Start by searching sysDrive for new files. 
+   136                              <1> ;FOR SCPBIOS.SYS, need the start sector of the file and the number of sectors
+   137                              <1> ; it is.
+   138                              <1> ;FOR SCPDOS.SYS, need only the start sector of the file.
+   139                              <1> 
+   140                              <1> ;We do this by:
+   141                              <1> ; - Reading the DPB, getting the first sector of the Root Directory
+   142                              <1> ; - Read the necessary data from the Root Directory Copy
+   143                              <1> ; - Read the BPB again
+   144                              <1> ; - Set the variables in the BPB.
+   145                              <1> ; - Set the bootable flag in the BPB
+   146                              <1> ; - Write it back out to disk.
+   147                              <1> ;
+   148                              <1> ;3 Direct IO's needed. 
+   149                              <1> ;   1) Read Sector 1 of Root Dir
+   150                              <1> ;   2) Read BPB
+   151                              <1> ;   3) Write back BPB 
+   152 000001D7 488B2DAC030000      <1>     mov rbp, qword [dpbPtr]
+   153                              <1> ;Start by saving the free cluster count as DOS will force an
+   154                              <1> ; unnecessary recount due to Direct IO which is annoying on large disks.
+   155 000001DE 8B4531              <1>     mov eax, dword [rbp + dpb.dFreeClustCnt]
+   156 000001E1 8905B3030000        <1>     mov dword [dFreeClustCnt], eax
+   157                              <1> ;Now start procedure.
+   158 000001E7 31C0                <1>     xor eax, eax    ;Request first sector of root directory
+   159 000001E9 E8CE020000          <1>     call getStartSectorOfCluster    ;Thanks DOS!!
+   160 000001EE 4889059D030000      <1>     mov qword [xfrSector], rax
+   161                              <1>     ;rax has the first sector of the root directory, read it in
+   162 000001F5 E8EF020000          <1>     call readWrapper
+   163 000001FA 0F8270010000        <1>     jc badPrint
+   164                              <1>     ;First entry could be volume id so double check
+   165 00000200 488B3573030000      <1>     mov rsi, qword [memoryBlock]
+   166 00000207 F6460B08            <1>     test byte [rsi + fatDirEntry.attribute], dirVolumeID
+   167 0000020B 7407                <1>     jz .notVolID
+   168 0000020D 4881C620000000      <1>     add rsi, fatDirEntry_size   ;Goto next entry. This must be it
+   169                              <1> .notVolID:
+   170 00000214 0FB75614            <1>     movzx edx, word [rsi + fatDirEntry.fstClusHi]   ;Get hi bits of cluster num
+   171 00000218 0FB7461A            <1>     movzx eax, word [rsi + fatDirEntry.fstClusLo]
+   172 0000021C C1E210              <1>     shl edx, 10h    ;Move into high word
+   173 0000021F 09D0                <1>     or eax, edx     ;eax has the first cluster
+   174 00000221 E896020000          <1>     call getStartSectorOfCluster    ;Get the first sector to read
+   175 00000226 488905D5030000      <1>     mov qword [biosSector], rax
+   176 0000022D 31D2                <1>     xor edx, edx
+   177 0000022F 8B461C              <1>     mov eax, dword [rsi + fatDirEntry.fileSize] ;Get file size in bytes
+   178                              <1>     ;Divide by sector size
+   179 00000232 0FB71D4A030000      <1>     movzx ebx, word [sectorSize]    ;Get the sector size
+   180 00000239 F7F3                <1>     div ebx
+   181 0000023B 85D2                <1>     test edx, edx   ;If no remainder, eax has number of sectors for file
+   182 0000023D 7402                <1>     jz .skipPlusSector1
+   183 0000023F FFC0                <1>     inc eax ;Else add the final sector over
+   184                              <1> .skipPlusSector1:
+   185 00000241 668905C2030000      <1>     mov word [biosSize], ax
+   186 00000248 4881C620000000      <1>     add rsi, fatDirEntry_size   ;Goto next entry
+   187 0000024F 0FB75614            <1>     movzx edx, word [rsi + fatDirEntry.fstClusHi]   ;Get hi bits of cluster num
+   188 00000253 0FB7461A            <1>     movzx eax, word [rsi + fatDirEntry.fstClusLo]
+   189 00000257 C1E210              <1>     shl edx, 10h    ;Move into high word
+   190 0000025A 09D0                <1>     or eax, edx     ;eax has the first cluster
+   191 0000025C E85B020000          <1>     call getStartSectorOfCluster    ;Get the first sector to read
+   192 00000261 488905A4030000      <1>     mov qword [dosSector], rax
+   193                              <1> 
+   194                              <1>     ;Now we read the BPB in
+   195 00000268 31C0                <1>     xor eax, eax
+   196 0000026A 48890521030000      <1>     mov qword [xfrSector], rax  ;Read sector 0
+   197 00000271 E873020000          <1>     call readWrapper
+   198 00000276 0F82F4000000        <1>     jc badPrint
+   199                              <1>     ;Now we have the BPB in, set the variables and we are done.
+   200                              <1>     ;First set the variables that are past the end of the Boot Sector
+   201                              <1>     ;Then set the bootable flag and write back
+   202 0000027C 488B2D07030000      <1>     mov rbp, qword [dpbPtr]
+   203 00000283 E815020000          <1>     call getFATtype ;If ecx = 2, we have a 90 byte BPB, else 62 bytes
+   204 00000288 B83E000000          <1>     mov eax, 62
+   205 0000028D BB5A000000          <1>     mov ebx, 90
+   206 00000292 81F902000000        <1>     cmp ecx, 2
+   207 00000298 0F44C3              <1>     cmove eax, ebx 
+   208                              <1>     ;eax has the number of bytes the BIOS file vars are
+   209 0000029B 488B1DD8020000      <1>     mov rbx, qword [memoryBlock]
+   210 000002A2 488D3403            <1>     lea rsi, qword [rbx + rax]
+   211 000002A6 488B0555030000      <1>     mov rax, qword [biosSector]
+   212 000002AD 8B4B11              <1>     mov ecx, dword [rbx + bpb.hiddSec]  ;Must add hidden sectors too
+   213 000002B0 4801C8              <1>     add rax, rcx
+   214 000002B3 488906              <1>     mov qword [rsi], rax
+   215 000002B6 0FB7054D030000      <1>     movzx eax, word [biosSize]
+   216 000002BD 66894608            <1>     mov word [rsi + 8], ax
+   217                              <1>     ;Now to the table at the end of the boot sector
+   218 000002C1 0FB705BB020000      <1>     movzx eax, word [sectorSize]
+   219 000002C8 FFC8                <1>     dec eax ;Last byte in the sector is byte sectorSize-1
+   220 000002CA 488D7403F2          <1>     lea rsi, qword [rbx + rax - 14] ;Point to the start of the packet
+   221 000002CF 488B0536030000      <1>     mov rax, qword [dosSector]
+   222 000002D6 4801C8              <1>     add rax, rcx
+   223 000002D9 C6060C              <1>     mov byte [rsi + sysInitTableStruc.length], sysInitTableStruc_size - 1
+   224 000002DC C6460101            <1>     mov byte [rsi + sysInitTableStruc.numSec], 1
+   225 000002E0 66C746020000        <1>     mov word [rsi + sysInitTableStruc.resWord], 0
+   226 000002E6 48894604            <1>     mov qword [rsi + sysInitTableStruc.firstLba], rax
+   227 000002EA C6460CFF            <1>     mov byte [rsi + sysInitTableStruc.bootable], -1
+   228 000002EE E81C020000          <1>     call writeWrapper
+   229 000002F3 727B                <1>     jc badPrint
+   230 000002F5 E8A3010000          <1>     call getFATtype
+   231 000002FA 81F902000000        <1>     cmp ecx, 2
+   232 00000300 7518                <1>     jne exit
+   233 00000302 488B1D71020000      <1>     mov rbx, qword [memoryBlock]
+   234 00000309 480FB64327          <1>     movzx rax, byte [rbx + bpb32.BkBootSec]
+   235 0000030E 4889057D020000      <1>     mov qword [xfrSector], rax    ;Backup structure as well 
+   236 00000315 E8F5010000          <1>     call writeWrapper   ;Write the back up too
+   237                              <1> exit:
+   238                              <1> ;Finish by first restoring the free cluster count. This hasn't changed
+   239                              <1> ; but the direct IO set the free cluster count to -1 to force a recount
+   240                              <1> ; as the direct IO mightve hurt the free cluster count.
+   241 0000031A 8B057A020000        <1>     mov eax, dword [dFreeClustCnt]
+   242 00000320 894531              <1>     mov dword [rbp + dpb.dFreeClustCnt], eax
+   243 00000323 E840020000          <1>     call dosCrit1Exit
+   244 00000328 E856000000          <1>     call freeResources
+   245 0000032D 488D1522040000      <1>     lea rdx, okMsg
+   246 00000334 B800090000          <1>     mov eax, 0900h
+   247 00000339 CD21                <1>     int 21h
+   248 0000033B B8004C0000          <1>     mov eax, 4C00h
+   249 00000340 CD21                <1>     int 21h
+   250                              <1> 
+   251                              <1> badXfer:
+   252 00000342 488D1D96030000      <1>     lea rbx, badMem
+   253 00000349 488D156D030000      <1>     lea rdx, badCopy
+   254 00000350 81F9FFFFFFFF        <1>     cmp ecx, -1 ;Little flag to indicate memory issue
+   255 00000356 480F44D3            <1>     cmove rdx, rbx
+   256 0000035A EB14                <1>     jmp short badPrint
+   257                              <1> badHandle:
+   258 0000035C 488D1D3C030000      <1>     lea rbx, badCreate
+   259 00000363 488D1519030000      <1>     lea rdx, badOpen
+   260 0000036A 85F6                <1>     test esi, esi
+   261 0000036C 480F44D3            <1>     cmovz rdx, rbx
+   262                              <1> badPrint:
+   263                              <1> ;Generic Print entry point
+   264 00000370 B800090000          <1>     mov eax, 0900h
+   265 00000375 CD21                <1>     int 21h
+   266                              <1> badExit:
+   267                              <1> ;DOS will close the handles for us if needed
+   268 00000377 E807000000          <1>     call freeResources
+   269 0000037C B8FF4C0000          <1>     mov eax, 4CFFh
+   270 00000381 CD21                <1>     int 21h
+   271                              <1> 
+   272                              <1> ;Utility functions
+   273                              <1> freeResources:
+   274 00000383 F605F8010000FF      <1>     test byte [inCrit], -1
+   275 0000038A 7405                <1>     jz .noCrit
+   276 0000038C E8D7010000          <1>     call dosCrit1Exit   ;Exit critical section
+   277                              <1> .noCrit:
+   278 00000391 0FBF1D06020000      <1>     movsx ebx, word [biosHdlSrc]
+   279 00000398 81FBFFFFFFFF        <1>     cmp ebx, -1
+   280 0000039E E865000000          <1>     call freeHandle
+   281 000003A3 0FBF1DF6010000      <1>     movsx ebx, word [biosHdlDst]
+   282 000003AA 81FBFFFFFFFF        <1>     cmp ebx, -1
+   283 000003B0 E853000000          <1>     call freeHandle
+   284 000003B5 0FBF1DE6010000      <1>     movsx ebx, word [dosHdlSrc]
+   285 000003BC 81FBFFFFFFFF        <1>     cmp ebx, -1
+   286 000003C2 E841000000          <1>     call freeHandle
+   287 000003C7 0FBF1DD6010000      <1>     movsx ebx, word [dosHdlDst]
+   288 000003CE 81FBFFFFFFFF        <1>     cmp ebx, -1
+   289 000003D4 0FBF1DCD010000      <1>     movsx ebx, word [cmdHdlDst]
+   290 000003DB 81FBFFFFFFFF        <1>     cmp ebx, -1
+   291 000003E1 0FBF1DC0010000      <1>     movsx ebx, word [cmdHdlDst]
+   292 000003E8 81FBFFFFFFFF        <1>     cmp ebx, -1
+   293 000003EE E815000000          <1>     call freeHandle
+   294 000003F3 4C8B0580010000      <1>     mov r8, qword [memoryBlock]
+   295 000003FA 4D85C0              <1>     test r8, r8
+   296                              <1>     retz
+    41                              <2> cret z
+    19                              <3> %%_base:
+    20                              <3> %assign baseVar %%_base-$$
+    21                              <3>  %ifdef retOff
+    22                              <3>  %if (baseVar - retOff <= 126) && (baseVar > retOff)
+    23                              <3>  %ifdef currSegVBase
+    24                              <3>  j%+1 short (retOff+currSegVBase)
+    25                              <3>  %else
+    26                              <3>  j%+1 short retOff
+    27                              <3>  %endif
+    28                              <3>  %else
+    29                              <3>  j%-1 short %%a
+    30                              <3>  return
+    31                              <3> %%a:
+    32                              <3>  %endif
+    33                              <3>  %else
+    34 000003FD 7501                <3>  j%-1 short %%a
+    35                              <3>  return
+    13                              <4> %%_ret:
+    14 000003FF C3                  <4>  ret
+    15                              <4> %assign retOff %%_ret-$$
+    36                              <3> %%a:
+    37                              <3>  %endif
+   297 00000400 B800490000          <1>     mov eax, 4900h  ;Free block
+   298 00000405 CD21                <1>     int 21h
+   299                              <1>     return
+    13                              <2> %%_ret:
+    14 00000407 C3                  <2>  ret
+    15                              <2> %assign retOff %%_ret-$$
+   300                              <1> freeHandle:
+   301                              <1>     retz    ;Return if equal
+    41                              <2> cret z
+    19                              <3> %%_base:
+    20                              <3> %assign baseVar %%_base-$$
+    21                              <3>  %ifdef retOff
+    22                              <3>  %if (baseVar - retOff <= 126) && (baseVar > retOff)
+    23                              <3>  %ifdef currSegVBase
+    24                              <3>  j%+1 short (retOff+currSegVBase)
+    25                              <3>  %else
+    26 00000408 74(07)              <3>  j%+1 short retOff
+    27                              <3>  %endif
+    28                              <3>  %else
+    29                              <3>  j%-1 short %%a
+    30                              <3>  return
+    31                              <3> %%a:
+    32                              <3>  %endif
+    33                              <3>  %else
+    34                              <3>  j%-1 short %%a
+    35                              <3>  return
+    36                              <3> %%a:
+    37                              <3>  %endif
+   302 0000040A B8003E0000          <1>     mov eax, 3E00h
+   303 0000040F CD21                <1>     int 21h
+   304                              <1>     return
+    13                              <2> %%_ret:
+    14 00000411 C3                  <2>  ret
+    15                              <2> %assign retOff %%_ret-$$
+   305                              <1> 
+   306                              <1> openFiles:
+   307                              <1> ;Input: rsi = Name Pair ptr
+   308                              <1> ;       rcx = Name Pair length
+   309                              <1> ;       bl = Attribute to open with
+   310                              <1> ;       rdi = Handle pair ptr
+   311                              <1> ;Return:
+   312                              <1> ;   If CF=CY and esi = 0, error on create, else error on open
+   313 00000412 4889F2              <1>     mov rdx, rsi
+   314 00000415 B8003D0000          <1>     mov eax, 3D00h  ;Open in Read-Only mode
+   315 0000041A CD21                <1>     int 21h
+   316                              <1>     retc
+    57                              <2> cret c
+    19                              <3> %%_base:
+    20                              <3> %assign baseVar %%_base-$$
+    21                              <3>  %ifdef retOff
+    22                              <3>  %if (baseVar - retOff <= 126) && (baseVar > retOff)
+    23                              <3>  %ifdef currSegVBase
+    24                              <3>  j%+1 short (retOff+currSegVBase)
+    25                              <3>  %else
+    26 0000041C 72(11)              <3>  j%+1 short retOff
+    27                              <3>  %endif
+    28                              <3>  %else
+    29                              <3>  j%-1 short %%a
+    30                              <3>  return
+    31                              <3> %%a:
+    32                              <3>  %endif
+    33                              <3>  %else
+    34                              <3>  j%-1 short %%a
+    35                              <3>  return
+    36                              <3> %%a:
+    37                              <3>  %endif
+   317 0000041E 668907              <1>     mov word [rdi], ax  ;Place it in the source handle
+   318                              <1> 
+   319 00000421 4801CE              <1>     add rsi, rcx    ;Move the name forwards by its length
+   320 00000424 4889F2              <1>     mov rdx, rsi
+   321 00000427 31F6                <1>     xor esi, esi    ;Indicate we are in the create phase now
+   322 00000429 0FB6CB              <1>     movzx ecx, bl
+   323 0000042C B8003C0000          <1>     mov eax, 3C00h
+   324 00000431 CD21                <1>     int 21h
+   325                              <1>     retc
+    57                              <2> cret c
+    19                              <3> %%_base:
+    20                              <3> %assign baseVar %%_base-$$
+    21                              <3>  %ifdef retOff
+    22                              <3>  %if (baseVar - retOff <= 126) && (baseVar > retOff)
+    23                              <3>  %ifdef currSegVBase
+    24                              <3>  j%+1 short (retOff+currSegVBase)
+    25                              <3>  %else
+    26 00000433 72(11)              <3>  j%+1 short retOff
+    27                              <3>  %endif
+    28                              <3>  %else
+    29                              <3>  j%-1 short %%a
+    30                              <3>  return
+    31                              <3> %%a:
+    32                              <3>  %endif
+    33                              <3>  %else
+    34                              <3>  j%-1 short %%a
+    35                              <3>  return
+    36                              <3> %%a:
+    37                              <3>  %endif
+   326 00000435 66894702            <1>     mov word [rdi + 2], ax  ;Place it in the destination handle
+   327                              <1>     return
+    13                              <2> %%_ret:
+    14 00000439 C3                  <2>  ret
+    15                              <2> %assign retOff %%_ret-$$
+   328                              <1> 
+   329                              <1> copyFile:
+   330                              <1> ;Copies in sector sized chunks
+   331                              <1> ;Input: 
+   332                              <1> ;rsi points to the word pair to use for handles
+   333                              <1> ;Exit:
+   334                              <1> ;If a CF=CY error is returned, something bad happened. If ecx = -1, error
+   335                              <1> ; happened in the memory allocation portion of the copy
+   336 0000043A 488B1539010000      <1>     mov rdx, qword [memoryBlock]
+   337 00000441 4885D2              <1>     test rdx, rdx
+   338 00000444 7522                <1>     jnz .skipRealloc    ;If there is a block, dont allocate one again
+   339 00000446 0FB71D36010000      <1>     movzx ebx, word [sectorSize]
+   340 0000044D C1EB04              <1>     shr ebx, 4  ;Convert to paragraphs
+   341 00000450 B800480000          <1>     mov eax, 4800h
+   342 00000455 CD21                <1>     int 21h
+   343 00000457 B9FFFFFFFF          <1>     mov ecx, -1
+   344                              <1>     retc    ;Return if error
+    57                              <2> cret c
+    19                              <3> %%_base:
+    20                              <3> %assign baseVar %%_base-$$
+    21                              <3>  %ifdef retOff
+    22                              <3>  %if (baseVar - retOff <= 126) && (baseVar > retOff)
+    23                              <3>  %ifdef currSegVBase
+    24                              <3>  j%+1 short (retOff+currSegVBase)
+    25                              <3>  %else
+    26 0000045C 72(39)              <3>  j%+1 short retOff
+    27                              <3>  %endif
+    28                              <3>  %else
+    29                              <3>  j%-1 short %%a
+    30                              <3>  return
+    31                              <3> %%a:
+    32                              <3>  %endif
+    33                              <3>  %else
+    34                              <3>  j%-1 short %%a
+    35                              <3>  return
+    36                              <3> %%a:
+    37                              <3>  %endif
+   345 0000045E 48890515010000      <1>     mov qword [memoryBlock], rax    ;Save the ptr here
+   346 00000465 4889C2              <1>     mov rdx, rax
+   347                              <1> .skipRealloc:
+   348                              <1> ;rdx points to buffer to do IO through
+   349 00000468 668B1E              <1>     mov bx, word [rsi]  ;Get source file read
+   350 0000046B 0FB70D11010000      <1>     movzx ecx, word [sectorSize]   
+   351 00000472 B8003F0000          <1>     mov eax, 3F00h  ;Read handle
+   352 00000477 CD21                <1>     int 21h
+   353                              <1>     retc    ;Return if error
+    57                              <2> cret c
+    19                              <3> %%_base:
+    20                              <3> %assign baseVar %%_base-$$
+    21                              <3>  %ifdef retOff
+    22                              <3>  %if (baseVar - retOff <= 126) && (baseVar > retOff)
+    23                              <3>  %ifdef currSegVBase
+    24                              <3>  j%+1 short (retOff+currSegVBase)
+    25                              <3>  %else
+    26 00000479 72(39)              <3>  j%+1 short retOff
+    27                              <3>  %endif
+    28                              <3>  %else
+    29                              <3>  j%-1 short %%a
+    30                              <3>  return
+    31                              <3> %%a:
+    32                              <3>  %endif
+    33                              <3>  %else
+    34                              <3>  j%-1 short %%a
+    35                              <3>  return
+    36                              <3> %%a:
+    37                              <3>  %endif
+   354 0000047B 668B5E02            <1>     mov bx, word [rsi + 2]
+   355 0000047F 89C1                <1>     mov ecx, eax    ;Move the number of bytes to write into ecx
+   356 00000481 89C7                <1>     mov edi, eax    ;Keep a copy for later
+   357 00000483 B800400000          <1>     mov eax, 4000h  ;Write handle
+   358 00000488 CD21                <1>     int 21h
+   359                              <1>     retc
+    57                              <2> cret c
+    19                              <3> %%_base:
+    20                              <3> %assign baseVar %%_base-$$
+    21                              <3>  %ifdef retOff
+    22                              <3>  %if (baseVar - retOff <= 126) && (baseVar > retOff)
+    23                              <3>  %ifdef currSegVBase
+    24                              <3>  j%+1 short (retOff+currSegVBase)
+    25                              <3>  %else
+    26 0000048A 72(39)              <3>  j%+1 short retOff
+    27                              <3>  %endif
+    28                              <3>  %else
+    29                              <3>  j%-1 short %%a
+    30                              <3>  return
+    31                              <3> %%a:
+    32                              <3>  %endif
+    33                              <3>  %else
+    34                              <3>  j%-1 short %%a
+    35                              <3>  return
+    36                              <3> %%a:
+    37                              <3>  %endif
+   360 0000048C 39F9                <1>     cmp ecx, edi    ;Did we write the same as we read?
+   361 0000048E 750B                <1>     jne .badExit
+   362 00000490 663B3DEC000000      <1>     cmp di, word [sectorSize]   ;Did we read less than sector size?
+   363 00000497 74CF                <1>     je .skipRealloc
+   364 00000499 F8                  <1>     clc
+   365                              <1>     return  ;If not equal, exit
+    13                              <2> %%_ret:
+    14 0000049A C3                  <2>  ret
+    15                              <2> %assign retOff %%_ret-$$
+   366                              <1> .badExit:
+   367 0000049B F9                  <1>     stc
+   368                              <1>     return
+    13                              <2> %%_ret:
+    14 0000049C C3                  <2>  ret
+    15                              <2> %assign retOff %%_ret-$$
+   369                              <1> 
+   370                              <1> getFATtype:
+   371                              <1> ;Gets a pointer to a DPB and returns the FAT type on the drive
+   372                              <1> ;Entry: rbp = DPB to ascertain FAT
+   373                              <1> ;Exit: ecx = 0 => FAT 12, ecx = 1 => FAT 16, ecx = 2 => FAT 32
+   374 0000049D 53                  <1>     push rbx
+   375 0000049E 8B5D0F              <1>     mov ebx, dword [rbp + dpb.dMaxClusterAddr]
+   376 000004A1 B902000000          <1>     mov ecx, 2  ;FAT 32 marker
+   377 000004A6 81FBF5FF0000        <1>     cmp ebx, fat16MaxClustCnt
+   378 000004AC 730C                <1>     jae .exit
+   379 000004AE FFC9                <1>     dec ecx     ;FAT 16 marker
+   380 000004B0 81FBF50F0000        <1>     cmp ebx, fat12MaxClustCnt
+   381 000004B6 7302                <1>     jae .exit
+   382 000004B8 FFC9                <1>     dec ecx     ;FAT 12 marker
+   383                              <1> .exit:
+   384 000004BA 5B                  <1>     pop rbx
+   385                              <1>     return
+    13                              <2> %%_ret:
+    14 000004BB C3                  <2>  ret
+    15                              <2> %assign retOff %%_ret-$$
+   386                              <1> 
+   387                              <1> getStartSectorOfCluster:
+   388                              <1> ;Input: eax = Cluster Number
+   389                              <1> ;       rbp = dpb pointer
+   390                              <1> ;Output: rax = Starting Sector number for cluster
+   391                              <1> ;Gives the data sector we are at in the current cluster
+   392                              <1> ;Start Sector = (ClusterNumber - 2)*SecPerClust + DataAreaStartSector
+   393 000004BC 51                  <1>     push rcx
+   394 000004BD 09C0                <1>     or eax, eax ;Zero upper dword
+   395 000004BF 7416                <1>     jz .rootDir ;If eax is zero, that is an alias for Root Directory
+   396                              <1> .fat32Root:
+   397 000004C1 482D02000000        <1>     sub rax, 2
+   398 000004C7 8A4D05              <1>     mov cl, byte [rbp + dpb.bSecPerClustShift]
+   399 000004CA 48D3E0              <1>     shl rax, cl
+   400 000004CD 31C9                <1>     xor ecx, ecx
+   401 000004CF 8B4D0B              <1>     mov ecx, dword [rbp + dpb.dClusterHeapOffset]
+   402 000004D2 4801C8              <1>     add rax, rcx
+   403                              <1>     ;rax now has the first sector of the current cluster
+   404 000004D5 59                  <1>     pop rcx
+   405                              <1>     return
+    13                              <2> %%_ret:
+    14 000004D6 C3                  <2>  ret
+    15                              <2> %assign retOff %%_ret-$$
+   406                              <1> .rootDir:
+   407 000004D7 8B4517              <1>     mov eax, dword [rbp + dpb.dFirstUnitOfRootDir]
+   408 000004DA E8BEFFFFFF          <1>     call getFATtype
+   409 000004DF 81F902000000        <1>     cmp ecx, 2
+   410 000004E5 74DA                <1>     je .fat32Root   ;If FAT32, eax now has zero extended 1st cluster of Root Dir
+   411                              <1>     ;Else rax has the first sector of the Root Dir
+   412 000004E7 59                  <1>     pop rcx
+   413                              <1>     return
+    13                              <2> %%_ret:
+    14 000004E8 C3                  <2>  ret
+    15                              <2> %assign retOff %%_ret-$$
+   414                              <1> 
+   415                              <1> readWrapper:
+   416                              <1> ;Reads the sector specified in xfrSector
+   417                              <1> ;If returned with CF=CY, exit to badPrint
+   418 000004E9 BE03000000          <1>     mov esi, 3
+   419                              <1> .lp:
+   420 000004EE 488B159D000000      <1>     mov rdx, qword [xfrSector]
+   421 000004F5 B901000000          <1>     mov ecx, 1
+   422 000004FA 56                  <1>     push rsi
+   423 000004FB E835000000          <1>     call readSector ;Read the sector into the buffer
+   424 00000500 5E                  <1>     pop rsi
+   425                              <1>     retnc
+    61                              <2> cret nc
+    19                              <3> %%_base:
+    20                              <3> %assign baseVar %%_base-$$
+    21                              <3>  %ifdef retOff
+    22                              <3>  %if (baseVar - retOff <= 126) && (baseVar > retOff)
+    23                              <3>  %ifdef currSegVBase
+    24                              <3>  j%+1 short (retOff+currSegVBase)
+    25                              <3>  %else
+    26 00000501 73(E8)              <3>  j%+1 short retOff
+    27                              <3>  %endif
+    28                              <3>  %else
+    29                              <3>  j%-1 short %%a
+    30                              <3>  return
+    31                              <3> %%a:
+    32                              <3>  %endif
+    33                              <3>  %else
+    34                              <3>  j%-1 short %%a
+    35                              <3>  return
+    36                              <3> %%a:
+    37                              <3>  %endif
+   426 00000503 FFCE                <1>     dec esi
+   427 00000505 75E7                <1>     jnz .lp
+   428 00000507 488D151B020000      <1>     lea rdx, badDirectI
+   429                              <1>     return
+    13                              <2> %%_ret:
+    14 0000050E C3                  <2>  ret
+    15                              <2> %assign retOff %%_ret-$$
+   430                              <1> 
+   431                              <1> writeWrapper:
+   432                              <1> ;Writes to the sector specified in xfrSector
+   433                              <1> ;If returned with CF=CY, exit to badPrint
+   434 0000050F BE03000000          <1>     mov esi, 3
+   435                              <1> .lp:
+   436 00000514 488B1577000000      <1>     mov rdx, qword [xfrSector]
+   437 0000051B B901000000          <1>     mov ecx, 1
+   438 00000520 56                  <1>     push rsi
+   439 00000521 E820000000          <1>     call writeSector ;Write the sector from the buffer
+   440 00000526 5E                  <1>     pop rsi
+   441                              <1>     retnc
+    61                              <2> cret nc
+    19                              <3> %%_base:
+    20                              <3> %assign baseVar %%_base-$$
+    21                              <3>  %ifdef retOff
+    22                              <3>  %if (baseVar - retOff <= 126) && (baseVar > retOff)
+    23                              <3>  %ifdef currSegVBase
+    24                              <3>  j%+1 short (retOff+currSegVBase)
+    25                              <3>  %else
+    26 00000527 73(0E)              <3>  j%+1 short retOff
+    27                              <3>  %endif
+    28                              <3>  %else
+    29                              <3>  j%-1 short %%a
+    30                              <3>  return
+    31                              <3> %%a:
+    32                              <3>  %endif
+    33                              <3>  %else
+    34                              <3>  j%-1 short %%a
+    35                              <3>  return
+    36                              <3> %%a:
+    37                              <3>  %endif
+   442 00000529 FFCE                <1>     dec esi
+   443 0000052B 75E7                <1>     jnz .lp
+   444 0000052D 488D15F5010000      <1>     lea rdx, badDirectI
+   445                              <1>     return
+    13                              <2> %%_ret:
+    14 00000534 C3                  <2>  ret
+    15                              <2> %assign retOff %%_ret-$$
+   446                              <1> 
+   447                              <1> readSector:
+   448                              <1> ;Input:
+   449                              <1> ;ecx = Number of sectors to read
+   450                              <1> ;rdx = Start LBA to read from
+   451 00000535 8A053E000000        <1>     mov al, byte [sysDrive]     ; Always read from sysDrive
+   452 0000053B 488B1D38000000      <1>     mov rbx, qword [memoryBlock] ; Memory Buffer address to read from
+   453 00000542 CD25                <1>     int 25h
+   454 00000544 58                  <1>     pop rax ;Pop old flags into rax
+   455                              <1>     return
+    13                              <2> %%_ret:
+    14 00000545 C3                  <2>  ret
+    15                              <2> %assign retOff %%_ret-$$
+   456                              <1> writeSector:
+   457                              <1> ;Input:
+   458                              <1> ;al = Drive number
+   459                              <1> ;ecx = Number of sectors to write
+   460                              <1> ;rdx = Start LBA to write to
+   461 00000546 8A052D000000        <1>     mov al, byte [sysDrive]     ; Always write to sysDrive
+   462 0000054C 488B1D27000000      <1>     mov rbx, qword [memoryBlock] ; Memory Buffer address to read from
+   463 00000553 CD26                <1>     int 26h
+   464 00000555 58                  <1>     pop rax ;Pop old flags into rax
+   465                              <1>     return
+    13                              <2> %%_ret:
+    14 00000556 C3                  <2>  ret
+    15                              <2> %assign retOff %%_ret-$$
+   466                              <1> 
+   467                              <1> dosCrit1Enter:
+   468 00000557 C60524000000FF      <1>     mov byte [inCrit], -1
+   469 0000055E 50                  <1>     push rax 
+   470 0000055F B801800000          <1>     mov eax, 8001h
+   471 00000564 CD2A                <1>     int 2ah
+   472 00000566 58                  <1>     pop rax
+   473                              <1>     return
+    13                              <2> %%_ret:
+    14 00000567 C3                  <2>  ret
+    15                              <2> %assign retOff %%_ret-$$
+   474                              <1> 
+   475                              <1> dosCrit1Exit:
+   476 00000568 50                  <1>     push rax 
+   477 00000569 B801810000          <1>     mov eax, 8101h
+   478 0000056E CD2A                <1>     int 2ah
+   479 00000570 58                  <1>     pop rax
+   480 00000571 C6050A00000000      <1>     mov byte [inCrit], 0
+   481                              <1>     return
+    13                              <2> %%_ret:
+    14 00000578 C3                  <2>  ret
+    15                              <2> %assign retOff %%_ret-$$
+    45                                  %include "./data/sysData.asm"
+     1 00000579 FF                  <1> sysDrive    db -1   ;Drive we want to install the system files on
+     2 0000057A 0000000000000000    <1> memoryBlock dq 0    ;Null ptr is unused
+     3 00000582 00                  <1> inCrit      db 0    ;If -1, in critical section
+     4 00000583 0000                <1> sectorSize  dw 0
+     5 00000585 00                  <1> secPerClus  db 0
+     6 00000586 00000000            <1> clustCnt    dd 0    ;Used for figuring out the FAT type
+     7 0000058A 0000000000000000    <1> dpbPtr      dq 0    ;Used for finding the first sector of the Root Dir
+     8 00000592 0000000000000000    <1> xfrSector   dq 0    ;Used to temporarily store the sector number
+     9                              <1> 
+    10                              <1> ;Free Cluster Information Backup (to overcome DOS's destruction)
+    11 0000059A FFFFFFFF            <1> dFreeClustCnt   dd -1  ;Number of free clusters, -1 unknown
+    12                              <1> 
+    13                              <1> biosPair:
+    14 0000059E FFFF                <1> biosHdlSrc  dw -1   ;File handles
+    15 000005A0 FFFF                <1> biosHdlDst  dw -1
+    16                              <1> 
+    17                              <1> dosPair:
+    18 000005A2 FFFF                <1> dosHdlSrc   dw -1
+    19 000005A4 FFFF                <1> dosHdlDst   dw -1
+    20                              <1> 
+    21                              <1> cmdPair:
+    22 000005A6 FFFF                <1> cmdHdlSrc   dw -1
+    23 000005A8 FFFF                <1> cmdHdlDst   dw -1
+    24                              <1> 
+    25                              <1> biosNamePair:
+    26 000005AA 413A5C53435042494F- <1> biosFile    db "A:\SCPBIOS.SYS",0   ;A should be overwritten with current drive
+    26 000005B3 532E53595300        <1>
+    27                              <1> biosNameL   equ $ - biosFile
+    28 000005B9 413A5C53435042494F- <1> biosDest    db "A:\SCPBIOS.SYS",0
+    28 000005C2 532E53595300        <1>
+    29                              <1> dosNamePair:
+    30 000005C8 413A5C534350444F53- <1> dosFile     db "A:\SCPDOS.SYS",0
+    30 000005D1 2E53595300          <1>
+    31                              <1> dosNameL   equ $ - dosFile
+    32 000005D6 413A5C534350444F53- <1> dosDest     db "A:\SCPDOS.SYS",0
+    32 000005DF 2E53595300          <1>
+    33                              <1> cmdNamePair:
+    34 000005E4 413A5C434F4D4D414E- <1> cmdFile     db "A:\COMMAND.COM",0
+    34 000005ED 442E434F4D00        <1>
+    35                              <1> cmdNameL   equ $ - cmdFile
+    36 000005F3 413A5C434F4D4D414E- <1> cmdDest     db "A:\COMMAND.COM",0
+    36 000005FC 442E434F4D00        <1>
+    37                              <1> ;Data for Boot Sector
+    38 00000602 0000000000000000    <1> biosSector  dq 0
+    39 0000060A 0000                <1> biosSize    dw 0
+    40 0000060C 0000000000000000    <1> dosSector   dq 0
+    41                              <1> 
+    42 00000614 413A5C2A2E2A00      <1> rootDir  db "A:\*.*",0  ;A should be overwritten with the letter given
+    43                              <1> 
+    44                              <1> ;Messages
+    45 0000061B 496E76616C69642044- <1> badVerStr   db "Invalid DOS Version",CR,LF,"$"
+    45 00000624 4F532056657273696F- <1>
+    45 0000062D 6E0D0A24            <1>
+    46 00000631 496E76616C69642044- <1> badDrvLtr   db "Invalid Drive Specified",CR,LF,"$"
+    46 0000063A 726976652053706563- <1>
+    46 00000643 69666965640D0A24    <1>
+    47 0000064B 526F6F742044697265- <1> badRootDir  db "Root Directory Not Empty",CR,LF,"$"
+    47 00000654 63746F7279204E6F74- <1>
+    47 0000065D 20456D7074790D0A24  <1>
+    48 00000666 4572726F722046696E- <1> badSearch   db "Error Finding System Files",CR,LF,"$"
+    48 0000066F 64696E672053797374- <1>
+    48 00000678 656D2046696C65730D- <1>
+    48 00000681 0A24                <1>
+    49 00000683 43616E6E6F74204F70- <1> badOpen     db "Cannot Open System Files.",CR,LF,"$"
+    49 0000068C 656E2053797374656D- <1>
+    49 00000695 2046696C65732E0D0A- <1>
+    49 0000069E 24                  <1>
+    50 0000069F 43616E6E6F74204372- <1> badCreate   db "Cannot Create System Files.",CR,LF,"$"
+    50 000006A8 656174652053797374- <1>
+    50 000006B1 656D2046696C65732E- <1>
+    50 000006BA 0D0A24              <1>
+    51 000006BD 4572726F7220547261- <1> badCopy     db "Error Transferring System Files",CR,LF,"$"
+    51 000006C6 6E7366657272696E67- <1>
+    51 000006CF 2053797374656D2046- <1>
+    51 000006D8 696C65730D0A24      <1>
+    52 000006DF 4E6F7420456E6F7567- <1> badMem      db "Not Enough Memory to Transfer System Files",CR,LF,"$"
+    52 000006E8 68204D656D6F727920- <1>
+    52 000006F1 746F205472616E7366- <1>
+    52 000006FA 65722053797374656D- <1>
+    52 00000703 2046696C65730D0A24  <1>
+    53 0000070C 496E76616C6964204D- <1> badSecSize  db "Invalid Medium Sector Size",CR,LF,"$"
+    53 00000715 656469756D20536563- <1>
+    53 0000071E 746F722053697A650D- <1>
+    53 00000727 0A24                <1>
+    54 00000729 556E61626C6520746F- <1> badDirectI  db "Unable to Read File",CR,LF,"$"
+    54 00000732 20526561642046696C- <1>
+    54 0000073B 650D0A24            <1>
+    55 0000073F 556E61626C6520746F- <1> badDirectO  db "Unable to Write File",CR,LF,"$"
+    55 00000748 205772697465204669- <1>
+    55 00000751 6C650D0A24          <1>
+    56 00000756 53797374656D205472- <1> okMsg       db "System Transfer Complete",CR,LF,"$"
+    56 0000075F 616E7366657220436F- <1>
+    56 00000768 6D706C6574650D0A24  <1>
+    56          ------------------  <1>  info: assembly required 1+2+2 passes
+ [--info=1]

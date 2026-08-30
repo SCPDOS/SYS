@@ -150,6 +150,11 @@ startSys:
 ;   2) Read BPB
 ;   3) Write back BPB 
     mov rbp, qword [dpbPtr]
+;Start by saving the free cluster count as DOS will force an
+; unnecessary recount due to Direct IO which is annoying on large disks.
+    mov eax, dword [rbp + dpb.dFreeClustCnt]
+    mov dword [dFreeClustCnt], eax
+;Now start procedure.
     xor eax, eax    ;Request first sector of root directory
     call getStartSectorOfCluster    ;Thanks DOS!!
     mov qword [xfrSector], rax
@@ -230,6 +235,11 @@ startSys:
     mov qword [xfrSector], rax    ;Backup structure as well 
     call writeWrapper   ;Write the back up too
 exit:
+;Finish by first restoring the free cluster count. This hasn't changed
+; but the direct IO set the free cluster count to -1 to force a recount
+; as the direct IO mightve hurt the free cluster count.
+    mov eax, dword [dFreeClustCnt]
+    mov dword [rbp + dpb.dFreeClustCnt], eax
     call dosCrit1Exit
     call freeResources
     lea rdx, okMsg
@@ -362,7 +372,7 @@ getFATtype:
 ;Entry: rbp = DPB to ascertain FAT
 ;Exit: ecx = 0 => FAT 12, ecx = 1 => FAT 16, ecx = 2 => FAT 32
     push rbx
-    mov ebx, dword [rbp + dpb.dClusterCount]
+    mov ebx, dword [rbp + dpb.dMaxClusterAddr]
     mov ecx, 2  ;FAT 32 marker
     cmp ebx, fat16MaxClustCnt
     jae .exit
@@ -385,7 +395,7 @@ getStartSectorOfCluster:
     jz .rootDir ;If eax is zero, that is an alias for Root Directory
 .fat32Root:
     sub rax, 2
-    mov cl, byte [rbp + dpb.bSectorsPerClusterShift]
+    mov cl, byte [rbp + dpb.bSecPerClustShift]
     shl rax, cl
     xor ecx, ecx
     mov ecx, dword [rbp + dpb.dClusterHeapOffset]
