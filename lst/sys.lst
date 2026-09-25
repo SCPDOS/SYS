@@ -1153,7 +1153,7 @@
    209 0000029B 488B1DD8020000      <1>     mov rbx, qword [memoryBlock]
    210 000002A2 488D3403            <1>     lea rsi, qword [rbx + rax]
    211 000002A6 488B0555030000      <1>     mov rax, qword [biosSector]
-   212 000002AD 8B4B11              <1>     mov ecx, dword [rbx + bpb.hiddSec]  ;Must add hidden sectors too
+   212 000002AD 8B4B1C              <1>     mov ecx, dword [rbx + oemHeader_size + bpb.hiddSec]  ;Must add hidden sectors too
    213 000002B0 4801C8              <1>     add rax, rcx
    214 000002B3 488906              <1>     mov qword [rsi], rax
    215 000002B6 0FB7054D030000      <1>     movzx eax, word [biosSize]
@@ -1175,7 +1175,7 @@
    231 000002FA 81F902000000        <1>     cmp ecx, 2
    232 00000300 7518                <1>     jne exit
    233 00000302 488B1D71020000      <1>     mov rbx, qword [memoryBlock]
-   234 00000309 480FB64327          <1>     movzx rax, byte [rbx + bpb32.BkBootSec]
+   234 00000309 480FB64332          <1>     movzx rax, byte [rbx + oemHeader_size + bpb32.BkBootSec]
    235 0000030E 4889057D020000      <1>     mov qword [xfrSector], rax    ;Backup structure as well 
    236 00000315 E8F5010000          <1>     call writeWrapper   ;Write the back up too
    237                              <1> exit:

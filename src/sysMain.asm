@@ -209,7 +209,7 @@ startSys:
     mov rbx, qword [memoryBlock]
     lea rsi, qword [rbx + rax]
     mov rax, qword [biosSector]
-    mov ecx, dword [rbx + bpb.hiddSec]  ;Must add hidden sectors too
+    mov ecx, dword [rbx + oemHeader_size + bpb.hiddSec]  ;Must add hidden sectors too
     add rax, rcx
     mov qword [rsi], rax
     movzx eax, word [biosSize]
@@ -231,7 +231,7 @@ startSys:
     cmp ecx, 2
     jne exit
     mov rbx, qword [memoryBlock]
-    movzx rax, byte [rbx + bpb32.BkBootSec]
+    movzx rax, byte [rbx + oemHeader_size + bpb32.BkBootSec]
     mov qword [xfrSector], rax    ;Backup structure as well 
     call writeWrapper   ;Write the back up too
 exit:
